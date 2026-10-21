@@ -64,6 +64,7 @@
 
   "commands.cbook.commandException": "You are not holding a book",
   "commands.cbook.success": "Successfully edited book",
+  "commands.cbook.titleTooLong": "Book title cannot be longer than %s characters",
 
   "commands.cbuildinfo.success": "Running clientcommands on version %s (%s@{%s})",
 
@@ -207,6 +208,8 @@
   "commands.client.cancel": "Cancel",
   "commands.client.componentTooDeeplyNested": "Chat component too deeply nested",
   "commands.client.crack": "Crack",
+  "commands.client.donate": "Thanks for installing clientcommands! If you appreciate this mod, consider %s!",
+  "commands.client.donate.link": "donating to me on ko-fi",
   "commands.client.enable": "Enable",
   "commands.client.excluding": "Invalid argument; excluded",
   "commands.client.expectedRegex": "Invalid regex %s",
@@ -360,6 +363,16 @@
   "connectFourGame.won": "Won!",
   "connectFourGame.yourMove": "It is your move",
 
+  "doubleClickMain.browseUnsupported": "Your system does not support opening links in a browser. You can copy and paste this URL instead: %s",
+  "doubleClickMain.errorOpeningLink": "Error opening link %s: %s",
+  "doubleClickMain.installFabric": "installing Fabric",
+  "doubleClickMain.installFabricUrl": "https://docs.fabricmc.net/players/installing-fabric/",
+  "doubleClickMain.installMods": "installing mods",
+  "doubleClickMain.installModsUrl": "https://docs.fabricmc.net/players/installing-mods",
+  "doubleClickMain.message1": "This is not the correct way to run clientcommands.",
+  "doubleClickMain.message2": "Clientcommands is a Minecraft mod. Follow the Fabric guidance for %s and %s.",
+  "doubleClickMain.unableToOpenLink": "Unable to Open Link",
+
   "enchCrack.addInfo": "Add Info",
   "enchCrack.bookshelfCount": "Bookshelf Count: %s",
   "enchCrack.bookshelfCount.actual": "Actual Bookshelf Count: %s",
@@ -396,6 +409,7 @@
   "playerManip.reset.baneOfArthropods": "Hit Arthropod with Bane of Arthropods",
   "playerManip.reset.consume": "Consumed",
   "playerManip.reset.crossbow": "Crossbow Used",
+  "playerManip.reset.desync": "Desync Detected",
   "playerManip.reset.drink": "Drunk",
   "playerManip.reset.dropItem": "Dropped Item",
   "playerManip.reset.enchanting": "Enchanted Item",
