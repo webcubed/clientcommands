@@ -40,6 +40,10 @@
     {
       "config": "mixins.clientcommands.json",
       "environment": "client"
+    },
+    {
+      "config": "mixins.clientcommands-fork.json",
+      "environment": "client"
     }
   ],
   "accessWidener": "clientcommands.aw",
