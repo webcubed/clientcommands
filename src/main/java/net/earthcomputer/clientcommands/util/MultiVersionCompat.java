@@ -25,21 +25,30 @@ public abstract sealed class MultiVersionCompat {
     public static final int V1_9 = 107;
     public static final int V1_11 = 315;
     public static final int V1_11_1 = 316;
+    public static final int V1_12 = 335;
     public static final int V1_13 = 393;
     public static final int V1_13_2 = 404;
     public static final int V1_14 = 477;
+    public static final int V1_14_1 = 480;
     public static final int V1_14_2 = 485;
     public static final int V1_15 = 573;
     public static final int V1_15_2 = 578;
     public static final int V1_16 = 735;
     public static final int V1_17 = 755;
+    public static final int V1_17_1 = 756;
     public static final int V1_18 = 757;
     public static final int V1_18_2 = 758;
+    public static final int V1_19 = 759;
+    public static final int V1_19_3 = 761;
+    public static final int V1_19_4 = 762;
     public static final int V1_20 = 763;
+    public static final int V1_20_5 = 766;
     public static final int V1_20_6 = 766;
     public static final int V1_21 = 767;
     public static final int V1_21_2 = 768;
     public static final int V1_21_9 = 773;
+    public static final int V1_21_11 = 774;
+    public static final int V26_3 = 777;
 
     public abstract int getProtocolVersion();
 
@@ -50,6 +59,11 @@ public abstract sealed class MultiVersionCompat {
     }
 
     public static final MultiVersionCompat INSTANCE = Util.make(() -> {
+        // the old server gametests connect to old versions through ViaFabricPlus, rather than simulating them
+        if (System.getProperty("fabric.client.gametest") != null && !FabricLoader.getInstance().isModLoaded("viafabricplus")) {
+            return new GameTestDebug();
+        }
+
         try {
             FabricLoader loader = FabricLoader.getInstance();
             if (loader.isModLoaded("viafabric")) {
@@ -64,6 +78,38 @@ public abstract sealed class MultiVersionCompat {
             return new None();
         }
     });
+
+    public static final class GameTestDebug extends MultiVersionCompat {
+        private int protocolVersion = SharedConstants.getProtocolVersion();
+        private String protocolName = SharedConstants.getCurrentVersion().name();
+
+        private GameTestDebug() {
+        }
+
+        public void setProtocolVersion(int protocolVersion, String protocolName) {
+            this.protocolVersion = protocolVersion;
+            this.protocolName = protocolName;
+        }
+
+        public void clearProtocolVersionOverride() {
+            this.protocolVersion = SharedConstants.getProtocolVersion();
+            this.protocolName = SharedConstants.getCurrentVersion().name();
+        }
+
+        public boolean hasProtocolVersionOverride() {
+            return protocolVersion != SharedConstants.getProtocolVersion();
+        }
+
+        @Override
+        public int getProtocolVersion() {
+            return protocolVersion;
+        }
+
+        @Override
+        public String getProtocolName() {
+            return protocolName;
+        }
+    }
 
     private static final class None extends MultiVersionCompat {
         @Override

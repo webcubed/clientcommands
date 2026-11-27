@@ -1,5 +1,8 @@
 package net.earthcomputer.clientcommands.features;
 
+import com.seedfinding.mcbiome.biome.Biomes;
+import com.seedfinding.mccore.util.data.Pair;
+import com.seedfinding.mccore.version.MCVersion;
 import com.seedfinding.mcfeature.loot.LootContext;
 import com.seedfinding.mcfeature.loot.LootGenerator;
 import com.seedfinding.mcfeature.loot.LootPool;
@@ -11,6 +14,10 @@ import com.seedfinding.mcfeature.loot.condition.OpenWaterCondition;
 import com.seedfinding.mcfeature.loot.entry.ItemEntry;
 import com.seedfinding.mcfeature.loot.entry.LootEntry;
 import com.seedfinding.mcfeature.loot.entry.TableEntry;
+import com.seedfinding.mcfeature.loot.function.ApplyDamageFunction;
+import com.seedfinding.mcfeature.loot.function.LootFunction;
+import com.seedfinding.mcfeature.loot.function.SetCountFunction;
+import com.seedfinding.mcfeature.loot.roll.ConstantRoll;
 import net.earthcomputer.clientcommands.Configs;
 import net.earthcomputer.clientcommands.command.ClientCommandHelper;
 import net.earthcomputer.clientcommands.command.PingCommand;
@@ -22,7 +29,9 @@ import net.earthcomputer.clientcommands.render.RenderQueue;
 import net.earthcomputer.clientcommands.task.LongTask;
 import net.earthcomputer.clientcommands.task.TaskManager;
 import net.earthcomputer.clientcommands.util.CUtil;
+import net.earthcomputer.clientcommands.util.MultiVersionCompat;
 import net.earthcomputer.clientcommands.util.SeedfindingUtil;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -31,22 +40,29 @@ import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
+import net.minecraft.resources.Identifier;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.tags.TagKey;
 import net.minecraft.util.Mth;
 import net.minecraft.util.RandomSource;
+import net.minecraft.util.Util;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntityTypes;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.projectile.FishingHook;
 import net.minecraft.world.entity.projectile.ProjectileUtil;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.alchemy.PotionContents;
+import net.minecraft.world.item.alchemy.Potions;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.level.Level;
@@ -62,6 +78,7 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.BooleanOp;
 import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
+import org.jetbrains.annotations.VisibleForTesting;
 import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayList;
@@ -87,11 +104,13 @@ public class FishingCracker {
     private static boolean hasWarnedMultipleEnchants = false;
 
     // loot state
-    private static ItemStack actualLoot;
+    private static ItemEntity caughtItem;
     private static final Catch[] expectedCatches = new Catch[21]; // must be an odd number
 
     // bobber state
     private static ItemStack tool;
+    private static float throwYRot;
+    private static float throwXRot;
     private static Vec3 bobberDestPos;
     private static int bobberNumTicks;
 
@@ -106,7 +125,9 @@ public class FishingCracker {
     private static final long[] timeSyncTimes = new long[5];
     private static int serverMspt = 50;
     private static volatile int averageTimeToEndOfTick = 0;
-    private static volatile int magicMillisecondsCorrection = -100;
+    private static final int DEFAULT_MAGIC_MILLISECONDS_CORRECTION = -100;
+    private static volatile int magicMillisecondsCorrection = DEFAULT_MAGIC_MILLISECONDS_CORRECTION;
+    private static final int MAX_MAGIC_MILLISECONDS_CORRECTION_CHANGE = 200;
     private static final ScheduledExecutorService DELAY_EXECUTOR = Executors.newSingleThreadScheduledExecutor();
 
     // state
@@ -117,6 +138,85 @@ public class FishingCracker {
     private static int expectedFishingRodUses = 0;
 
     // region LOOT SIMULATION
+
+    // seedfinding's fishing loot table is only correct for recent versions
+    private static LootTable getFishingLootTable() {
+        MCVersion version = SeedfindingUtil.getMCVersion();
+        return new LootTable(new LootPool(new ConstantRoll(1),
+            new TableEntry(() -> getFishingJunk(version), 10, -2),
+            version.isNewerOrEqualTo(MCVersion.v1_16)
+                ? new TableEntry(() -> getFishingTreasure(version), 5, 2).when(_ -> new OpenWaterCondition(true))
+                : new TableEntry(() -> getFishingTreasure(version), 5, 2),
+            new TableEntry(MCLootTables.FISHING_FISH, 85, -1)
+        ));
+    }
+
+    private static LootTable getFishingJunk(MCVersion version) {
+        List<LootEntry> entries = new ArrayList<>();
+        // lily pads were treasure before 1.16
+        if (version.isNewerOrEqualTo(MCVersion.v1_16)) {
+            entries.add(new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.LILY_PAD, 17));
+        }
+        entries.addAll(List.of(
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.LEATHER_BOOTS, 10).apply(_ -> new ApplyDamageFunction()),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.LEATHER, 10),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.BONE, 10),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.POTION, 10),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.STRING, 5),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.FISHING_ROD, 2).apply(_ -> new ApplyDamageFunction()),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.BOWL, 10),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.STICK, 5),
+            // before 1.11, ink sacs were more likely, but only one was caught
+            version.isNewerOrEqualTo(MCVersion.v1_11)
+                ? new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.INK_SAC, 1).apply(_ -> SetCountFunction.constant(10))
+                : new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.INK_SAC, 10),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.TRIPWIRE_HOOK, 10),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.ROTTEN_FLESH, 10)
+        ));
+        if (version.isNewerOrEqualTo(MCVersion.v1_14)) {
+            com.seedfinding.mcbiome.biome.Biome[] jungles = version.isNewerOrEqualTo(MCVersion.v1_18)
+                ? new com.seedfinding.mcbiome.biome.Biome[]{Biomes.JUNGLE, Biomes.JUNGLE_EDGE, Biomes.BAMBOO_JUNGLE}
+                : new com.seedfinding.mcbiome.biome.Biome[]{Biomes.JUNGLE, Biomes.JUNGLE_HILLS, Biomes.JUNGLE_EDGE, Biomes.BAMBOO_JUNGLE, Biomes.MODIFIED_JUNGLE, Biomes.MODIFIED_JUNGLE_EDGE, Biomes.BAMBOO_JUNGLE_HILLS};
+            entries.add(new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.BAMBOO, 10).when(_ -> new BiomeCondition(jungles)));
+        }
+        return new LootTable(new LootPool(new ConstantRoll(1), entries.toArray(LootEntry[]::new)));
+    }
+
+    private static LootTable getFishingTreasure(MCVersion version) {
+        List<LootEntry> entries = new ArrayList<>();
+        if (version.isOlderThan(MCVersion.v1_16)) {
+            entries.add(new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.LILY_PAD));
+        }
+        entries.addAll(List.of(
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.NAME_TAG),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.SADDLE),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.BOW).apply(_ -> new ApplyDamageFunction(), _ -> new EnchantWithLevelsFunction(30)),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.FISHING_ROD).apply(_ -> new ApplyDamageFunction(), _ -> new EnchantWithLevelsFunction(30)),
+            new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.BOOK).apply(_ -> new EnchantWithLevelsFunction(30))
+        ));
+        if (version.isNewerOrEqualTo(MCVersion.v1_13)) {
+            entries.add(new ItemEntry(com.seedfinding.mcfeature.loot.item.Items.NAUTILUS_SHELL));
+        }
+        return new LootTable(new LootPool(new ConstantRoll(1), entries.toArray(LootEntry[]::new)));
+    }
+
+    /**
+     * Enchants with treasure enchantments, using our enchantment simulation rather than seedfinding's, which doesn't
+     * match some versions.
+     */
+    private record EnchantWithLevelsFunction(int level) implements LootFunction {
+        @Override
+        public com.seedfinding.mcfeature.loot.item.ItemStack process(com.seedfinding.mcfeature.loot.item.ItemStack stack, LootContext context) {
+            ItemStack item = new ItemStack(BuiltInRegistries.ITEM.getValue(Identifier.withDefaultNamespace(stack.getItem().getName())));
+            // the internal seed is scrambled again by the constructor, which unscrambles it
+            LegacyRandomSource random = new LegacyRandomSource(context.getSeed() ^ 0x5deece66dL);
+            for (LegacyEnchantment.Instance enchantment : LegacyEnchantment.addRandomEnchantments(random, item, level, true, MultiVersionCompat.INSTANCE.getProtocolVersion())) {
+                stack.getItem().addEnchantment(new Pair<>(SeedfindingUtil.toSeedfindingEnchantment(enchantment.ench().enchantmentKey), enchantment.level()));
+            }
+            context.setSeed(random.seed.get(), false);
+            return stack;
+        }
+    }
 
     private static boolean isMatchingLoot(ItemStack loot, ClientItemPredicateArgument.ClientItemPredicate goal) {
         return goal.getPossibleItems().contains(loot.getItem());
@@ -152,7 +252,12 @@ public class FishingCracker {
         List<com.seedfinding.mcfeature.loot.item.ItemStack> result = Collections.emptyList();
 
         if (entry instanceof ItemEntry itemEntry) {
-            if (isMatchingLoot(SeedfindingUtil.fromSeedfindingItem(itemEntry.item, registryAccess), goal)) {
+            ItemStack item = SeedfindingUtil.fromSeedfindingItem(itemEntry.item, registryAccess);
+            // enchanting a book turns it into an enchanted book
+            if (item.is(Items.BOOK) && itemEntry.lootFunctions != null && Arrays.stream(itemEntry.lootFunctions).anyMatch(function -> function instanceof EnchantWithLevelsFunction)) {
+                item = new ItemStack(Items.ENCHANTED_BOOK);
+            }
+            if (isMatchingLoot(item, goal)) {
                 result = Collections.singletonList(new com.seedfinding.mcfeature.loot.item.ItemStack(itemEntry.item));
             }
         } else if (entry instanceof TableEntry tableEntry) {
@@ -262,6 +367,11 @@ public class FishingCracker {
             state = State.WAITING_FOR_BOBBER;
         }
         tool = stack;
+        LocalPlayer player = Minecraft.getInstance().player;
+        if (player != null) {
+            throwYRot = player.getYRot();
+            throwXRot = player.getXRot();
+        }
     }
 
     public static void reset() {
@@ -318,7 +428,12 @@ public class FishingCracker {
             LocalPlayer player = Minecraft.getInstance().player;
             if (player != null && canManipulateFishing()) {
                 if (packet.getData() == player.getId() && packet.getType() == EntityTypes.FISHING_BOBBER) {
-                    processBobberSpawn(packet.getUUID(), new Vec3(packet.getX(), packet.getY(), packet.getZ()), packet.getMovement());
+                    processBobberSpawn(packet.getUUID(), new Vec3(packet.getX(), packet.getY(), packet.getZ()));
+                }
+                // ViaVersion puts the value of experience orbs from servers older than 1.21.5 in the packet data,
+                // rather than syncing it
+                if (packet.getType() == EntityTypes.EXPERIENCE_ORB && packet.getData() > 0) {
+                    processExperienceOrbSpawn(packet.getX(), packet.getY(), packet.getZ(), packet.getData());
                 }
             }
         });
@@ -340,19 +455,24 @@ public class FishingCracker {
                 processExperienceOrbSpawn(orb.getX(), orb.getY(), orb.getZ(), orb.getValue());
             }
         });
-        MoreClientEvents.TIME_SYNC_ON_NETWORK_THREAD.register(packet -> {
-            if (Configs.fishingManipulation.isEnabled()) {
-                onTimeSync();
+        // the time syncs are always recorded, so that the server's tick rate is known as soon as fishing manipulation is enabled
+        MoreClientEvents.TIME_SYNC_ON_NETWORK_THREAD.register(packet -> onTimeSync());
+        ClientPlayConnectionEvents.JOIN.register((_, _, _) -> {
+            // the timings measured on a previous server would be wrong for this one
+            synchronized (timeSyncTimes) {
+                Arrays.fill(timeSyncTimes, 0);
+                serverMspt = 50;
             }
+            averageTimeToEndOfTick = 0;
+            resetMagicMillisecondsCorrection();
         });
     }
 
-    private static void processBobberSpawn(UUID fishingBobberUUID, Vec3 pos, Vec3 velocity) {
-        synchronized (STATE_LOCK) {
-            if (state != State.WAITING_FOR_FIRST_BOBBER_TICK) {
-                return;
-            }
-            state = State.WAITING_FOR_FISH;
+    private static void processBobberSpawn(UUID fishingBobberUUID, Vec3 pos) {
+        // the state only changes to WAITING_FOR_FISH once the target tick is known, otherwise onTimeSync could use the
+        // target tick of the previous bobber
+        if (state != State.WAITING_FOR_FIRST_BOBBER_TICK) {
+            return;
         }
 
         ClientLevel level = Minecraft.getInstance().level;
@@ -375,7 +495,7 @@ public class FishingCracker {
         bobberNumTicks = 0;
 
         long seed = optionalSeed.getAsLong();
-        SimulatedFishingBobber fishingBobber = new SimulatedFishingBobber(seed, tool, pos, velocity);
+        SimulatedFishingBobber fishingBobber = new SimulatedFishingBobber(seed, tool, pos, throwYRot, throwXRot);
 
         boolean wasCatchingFish = false;
         int ticksUntilOurItem = -1;
@@ -387,7 +507,7 @@ public class FishingCracker {
         // TODO: get a smarter number of max ticks based on the rarity of the item
         for (int ticks = 0; ticks < 10000; ticks++) {
             fishingBobber.tick();
-            bobberPositions.add(fishingBobber.pos);
+            bobberPositions.add(fishingBobber.position);
             if (fishingBobber.failedReason != null) {
                 bobberNumTicks = ticks;
                 for (int i = 0; i < bobberPositions.size(); i++) {
@@ -407,7 +527,7 @@ public class FishingCracker {
                 List<Catch> catches = fishingBobber.generateLoot();
 
                 if (ourExpectedCatchIndex == -1 && goals.stream().anyMatch(goal -> catches.stream().anyMatch(c -> goal.value().test(c.loot)))) {
-                    bobberDestPos = fishingBobber.pos;
+                    bobberDestPos = fishingBobber.position;
                     ticksUntilOurItem = ticks;
                     ourExpectedCatchIndex = possibleExpectedCatches.size();
                 }
@@ -423,7 +543,7 @@ public class FishingCracker {
             // diagnose issue
             Set<LootCondition> failedConditions = new HashSet<>();
             boolean impossible = true;
-            LootTable fishingLootTable = MCLootTables.FISHING.get().apply(SeedfindingUtil.getMCVersion());
+            LootTable fishingLootTable = getFishingLootTable().apply(SeedfindingUtil.getMCVersion());
             for (var goal : goals) {
                 if (goal.value() instanceof ClientItemPredicateArgument.EnchantedItemPredicate predicate) {
                     if (predicate.isEnchantedBook() && predicate.predicate.numEnchantments() >= 2) {
@@ -446,7 +566,7 @@ public class FishingCracker {
                 if (failedConditions.stream().anyMatch(it -> it instanceof OpenWaterCondition)) {
                     Component error = Component.translatable("commands.cfish.error.openWater").withStyle(style -> style.withColor(ChatFormatting.RED));
                     ClientCommandHelper.addOverlayMessage(error, 100);
-                    if (!fishingBobber.level.getBlockState(BlockPos.containing(fishingBobber.pos).above()).is(Blocks.LILY_PAD)) {
+                    if (!fishingBobber.level.getBlockState(BlockPos.containing(fishingBobber.position).above()).is(Blocks.LILY_PAD)) {
                         ClientCommandHelper.sendHelp(Component.translatable("commands.cfish.error.openWater.lilyPad"));
                     }
                     boolean foundFlowingWater = false;
@@ -493,28 +613,35 @@ public class FishingCracker {
                 reset();
             }
         } else {
-            totalTicksToWait = ticksUntilOurItem;
-            Arrays.fill(expectedCatches, null);
-            for (int i = Math.max(0, ourExpectedCatchIndex - expectedCatches.length / 2),
-                     e = Math.min(possibleExpectedCatches.size(), ourExpectedCatchIndex + 1 + expectedCatches.length / 2);
-                 i < e; i++) {
-                expectedCatches[i - ourExpectedCatchIndex + expectedCatches.length / 2] = possibleExpectedCatches.get(i);
+            synchronized (STATE_LOCK) {
+                if (state != State.WAITING_FOR_FIRST_BOBBER_TICK) {
+                    return;
+                }
+                totalTicksToWait = ticksUntilOurItem;
+                Arrays.fill(expectedCatches, null);
+                for (int i = Math.max(0, ourExpectedCatchIndex - expectedCatches.length / 2),
+                         e = Math.min(possibleExpectedCatches.size(), ourExpectedCatchIndex + 1 + expectedCatches.length / 2);
+                     i < e; i++) {
+                    expectedCatches[i - ourExpectedCatchIndex + expectedCatches.length / 2] = possibleExpectedCatches.get(i);
+                }
+                state = State.WAITING_FOR_FISH;
             }
         }
     }
 
-    public static void processItemSpawn(Vec3 pos, ItemStack stack) {
+    public static void processItemSpawn(ItemEntity item) {
         synchronized (STATE_LOCK) {
             if (state != State.WAITING_FOR_ITEM) {
                 return;
             }
+            Vec3 pos = item.position();
             if (Math.abs(pos.x - bobberDestPos.x) >= 1 || Math.abs(pos.z - bobberDestPos.z) >= 1 || Math.abs(pos.y - bobberDestPos.y) >= 5) {
                 return;
             }
             state = State.WAITING_FOR_XP;
         }
 
-        actualLoot = stack;
+        caughtItem = item;
     }
 
     private static void processExperienceOrbSpawn(double x, double y, double z, int experienceAmount) {
@@ -533,7 +660,9 @@ public class FishingCracker {
             reset();
         }
 
-        Catch actualCatch = new Catch(actualLoot, experienceAmount);
+        // the item can be synced again before the experience orb spawns, for example it's first synced as stone on
+        // servers older than 1.11
+        Catch actualCatch = new Catch(caughtItem.getItem(), experienceAmount);
         Catch expectedCatch = expectedCatches[expectedCatches.length / 2];
 
         List<Integer> indices = IntStream.range(0, expectedCatches.length)
@@ -564,20 +693,24 @@ public class FishingCracker {
             CombinedMedianEM.endtime = magicMillisecondsCorrection + serverMspt / 2 + (expectedCatches.length / 2) * serverMspt;
             CombinedMedianEM.width = serverMspt;
             CombinedMedianEM.run();
-            magicMillisecondsCorrection = (int) Math.round(CombinedMedianEM.mu);
+            // an ambiguous catch can make the estimate jump a long way, so only move part of the way towards it
+            int change = (int) Math.round(CombinedMedianEM.mu) - magicMillisecondsCorrection;
+            magicMillisecondsCorrection += Mth.clamp(change, -MAX_MAGIC_MILLISECONDS_CORRECTION_CHANGE, MAX_MAGIC_MILLISECONDS_CORRECTION_CHANGE);
         }
     }
 
     private static void onTimeSync() {
         long time = System.nanoTime();
-        //noinspection SuspiciousSystemArraycopy
-        System.arraycopy(timeSyncTimes, 1, timeSyncTimes, 0, timeSyncTimes.length - 1);
-        timeSyncTimes[timeSyncTimes.length - 1] = time;
-        if (timeSyncTimes[0] != 0) {
-            serverMspt = (int) ((time - timeSyncTimes[0]) / ((timeSyncTimes.length - 1) * 20 * 1000000));
+        synchronized (timeSyncTimes) {
+            //noinspection SuspiciousSystemArraycopy
+            System.arraycopy(timeSyncTimes, 1, timeSyncTimes, 0, timeSyncTimes.length - 1);
+            timeSyncTimes[timeSyncTimes.length - 1] = time;
+            if (timeSyncTimes[0] != 0) {
+                serverMspt = (int) ((time - timeSyncTimes[0]) / ((timeSyncTimes.length - 1) * 20 * 1000000));
+            }
         }
 
-        if (state == State.WAITING_FOR_FISH) {
+        if (Configs.fishingManipulation.isEnabled() && state == State.WAITING_FOR_FISH) {
             if (estimatedTicksElapsed == 0) {
                 estimatedTicksElapsed = (int) Math.ceil((double) (time - bobberStartTime)/(serverMspt * 1000000));
             } else {
@@ -657,13 +790,15 @@ public class FishingCracker {
     }
 
     private static void onFishingBobberEntity() {
-        bobberStartTime = System.nanoTime();
+        long time = System.nanoTime();
 
         synchronized (STATE_LOCK) {
+            // this is called again on the main thread, which is later
             if (state != State.WAITING_FOR_BOBBER) {
                 return;
             }
             state = State.WAITING_FOR_FIRST_BOBBER_TICK;
+            bobberStartTime = time;
 
             int thrownItemDeltaMillis = (int) ((bobberStartTime - throwTime) / 1000000);
             int localPingMillis = PingCommand.getLocalPing();
@@ -676,8 +811,34 @@ public class FishingCracker {
     }
 
     public static void onBobOutOfWater() {
+        // Before 1.14, the server skipped the first movement packet of an entity, but still treated it as sent, so all
+        // later movement packets are relative to the wrong position, and the client's bobber is out of place.
+        if (MultiVersionCompat.INSTANCE.getProtocolVersion() < MultiVersionCompat.V1_14) {
+            return;
+        }
         Component message = Component.translatable("commands.cfish.error.outOfWater").withStyle(style -> style.withColor(ChatFormatting.RED));
         ClientCommandHelper.addOverlayMessage(message, 100);
+    }
+
+    @VisibleForTesting
+    public static int getMagicMillisecondsCorrection() {
+        return magicMillisecondsCorrection;
+    }
+
+    @VisibleForTesting
+    public static void resetMagicMillisecondsCorrection() {
+        magicMillisecondsCorrection = DEFAULT_MAGIC_MILLISECONDS_CORRECTION;
+        CombinedMedianEM.data.clear();
+    }
+
+    @VisibleForTesting
+    public static int getTotalTicksToWait() {
+        return totalTicksToWait;
+    }
+
+    @VisibleForTesting
+    public static Catch[] getExpectedCatches() {
+        return expectedCatches.clone();
     }
 
     // endregion
@@ -704,7 +865,14 @@ public class FishingCracker {
             if (this.loot.isDamageableItem()) {
                 this.loot.setDamageValue(0);
             }
+            // ViaFabricPlus keeps the original NBT of items from old servers, which includes the damage
+            this.loot.remove(DataComponents.CUSTOM_DATA);
             this.experience = experience;
+        }
+
+        @VisibleForTesting
+        public ItemStack getLoot() {
+            return loot;
         }
 
         @Override
@@ -882,31 +1050,41 @@ public class FishingCracker {
     private static class SimulatedFishingBobber {
         private static final EntityDimensions FISHING_BOBBER_DIMENSIONS = EntityTypes.FISHING_BOBBER.getDimensions();
 
+        private static final float[] LEGACY_SIN_TABLE = Util.make(new float[65536], table -> {
+            for (int i = 0; i < table.length; i++) {
+                table[i] = (float) Math.sin(i * Math.PI * 2 / 65536);
+            }
+        });
+
         private final Level level = Objects.requireNonNull(Minecraft.getInstance().level);
 
         private final FishingHook fakeEntity;
 
         // state variables
-        private Vec3 pos;
+        private Vec3 position;
         private AABB boundingBox;
-        private Vec3 velocity;
+        private Vec3 deltaMovement;
         private boolean onGround;
-        private State state = State.FLYING;
-        private int hookCountdown;
-        private int fishTravelCountdown;
-        private boolean inOpenWater = true;
+        private FishHookState currentState = FishHookState.FLYING;
+        private int nibble;
+        private int timeUntilHooked;
+        private boolean openWater = true;
         private final Set<BlockPos> openWaterViolations = new LinkedHashSet<>(0);
-        private int outOfOpenWaterTicks;
-        private boolean caughtFish;
+        private int outOfWaterTime;
+        private boolean biting;
         private boolean horizontalCollision;
         private boolean verticalCollision;
-        private int waitCountdown;
-        private boolean touchingWater;
-        private boolean firstUpdate;
+        private int timeUntilLured;
+        private boolean wasTouchingWater;
+        private boolean firstTick;
+        private boolean inGroundLegacy;
+        private float moveDistLegacy;
+        private int nextStepLegacy = 1;
 
         private float fishAngle;
 
         private final RandomSource random;
+        private final int protocolVersion = MultiVersionCompat.INSTANCE.getProtocolVersion();
         private final ItemStack tool;
         private final int lureLevel;
         private final int luckLevel;
@@ -915,39 +1093,90 @@ public class FishingCracker {
         @Nullable
         private String failedReason;
 
-        public SimulatedFishingBobber(long seed, ItemStack tool, Vec3 pos, Vec3 velocity) {
+        public SimulatedFishingBobber(long seed, ItemStack tool, Vec3 position, float yRot, float xRot) {
             this.random = RandomSource.create(seed ^ 0x5deece66dL);
             // entity UUID
             Mth.createInsecureUUID(random);
 
-            // entity yaw and pitch (ProjectileEntity.setVelocity)
-            random.triangle(0, 1);
-            random.triangle(0, 1);
-            random.triangle(0, 1);
+            // the velocity in the spawn packet is rounded, so calculate the exact velocity like the server does instead
+            this.deltaMovement = calculateInitialDeltaMovement(Mth.wrapDegrees(yRot), xRot);
 
             this.tool = tool;
             this.lureLevel = CUtil.getEnchantmentLevel(level.registryAccess(), Enchantments.LURE, tool);
             this.luckLevel = CUtil.getEnchantmentLevel(level.registryAccess(), Enchantments.LUCK_OF_THE_SEA, tool);
-            this.pos = pos;
-            this.velocity = velocity;
-            this.boundingBox = FISHING_BOBBER_DIMENSIONS.makeBoundingBox(pos.x, pos.y, pos.z);
+            this.position = position;
+            this.boundingBox = FISHING_BOBBER_DIMENSIONS.makeBoundingBox(position.x, position.y, position.z);
 
-            this.fakeEntity = new FishingHook(Objects.requireNonNull(Minecraft.getInstance().player), level, 0, 0);
+            LocalPlayer player = Objects.requireNonNull(Minecraft.getInstance().player);
+            FishingHook realHook = player.fishing;
+            this.fakeEntity = new FishingHook(player, level, 0, 0);
+            // the constructor replaces the player's hook with the fake one
+            player.fishing = realHook;
+        }
+
+        private Vec3 calculateInitialDeltaMovement(float yRot, float xRot) {
+            if (protocolVersion < MultiVersionCompat.V1_11) {
+                float yRadians = yRot / 180.0F * (float) Math.PI;
+                float xRadians = xRot / 180.0F * (float) Math.PI;
+                double x = -legacySin(yRadians) * legacyCos(xRadians) * 0.4F;
+                double z = legacyCos(yRadians) * legacyCos(xRadians) * 0.4F;
+                double y = -legacySin(xRadians) * 0.4F;
+                float dist = (float) Math.sqrt(x * x + y * y + z * z);
+                x /= dist;
+                y /= dist;
+                z /= dist;
+                x += random.nextGaussian() * 0.0075F;
+                y += random.nextGaussian() * 0.0075F;
+                z += random.nextGaussian() * 0.0075F;
+                return new Vec3(x * 1.5F, y * 1.5F, z * 1.5F);
+            }
+
+            float yCos = legacyCos(-yRot * 0.017453292F - (float) Math.PI);
+            float ySin = legacySin(-yRot * 0.017453292F - (float) Math.PI);
+            float xCos = -legacyCos(-xRot * 0.017453292F);
+            float xSin = legacySin(-xRot * 0.017453292F);
+            Vec3 newMovement = new Vec3(-ySin, Mth.clamp(-(xSin / xCos), -5.0F, 5.0F), -yCos);
+            // the length was calculated as a float before 1.14
+            double dist = protocolVersion >= MultiVersionCompat.V1_14 ? newMovement.length() : (float) newMovement.length();
+            double[] multipliers = new double[3];
+            for (int i = 0; i < 3; i++) {
+                if (protocolVersion >= MultiVersionCompat.V1_19) {
+                    // the double overload, like the server
+                    multipliers[i] = 0.6 / dist + random.triangle(0.5, 0.0103365);
+                } else {
+                    multipliers[i] = 0.6 / dist + 0.5 + random.nextGaussian() * 0.0045;
+                }
+            }
+            return newMovement.multiply(multipliers[0], multipliers[1], multipliers[2]);
+        }
+
+        // the sine table used to be indexed using float arithmetic
+        private static float legacySin(float radians) {
+            return LEGACY_SIN_TABLE[(int) (radians * 10430.378F) & 65535];
+        }
+
+        private static float legacyCos(float radians) {
+            return LEGACY_SIN_TABLE[(int) (radians * 10430.378F + 16384.0F) & 65535];
         }
 
         public boolean canCatchFish() {
-            return hookCountdown > 0;
+            return nibble > 0;
         }
 
         public List<Catch> generateLoot() {
-            fakeEntity.absSnapTo(pos.x, pos.y, pos.z);
-            fakeEntity.setDeltaMovement(velocity);
+            fakeEntity.absSnapTo(position.x, position.y, position.z);
+            fakeEntity.setDeltaMovement(deltaMovement);
 
             LootContext lootContext = getLootContext();
 
             List<Catch> catches = new ArrayList<>();
-            for (var loot : MCLootTables.FISHING.get().generate(lootContext)) {
-                catches.add(new Catch(SeedfindingUtil.fromSeedfindingItem(loot, level.registryAccess()), 1 + lootContext.nextInt(6)));
+            for (var loot : getFishingLootTable().generate(lootContext)) {
+                ItemStack item = SeedfindingUtil.fromSeedfindingItem(loot, level.registryAccess());
+                // the potion that can be fished is a water bottle
+                if (item.is(Items.POTION)) {
+                    item.set(DataComponents.POTION_CONTENTS, new PotionContents(Potions.WATER));
+                }
+                catches.add(new Catch(item, 1 + lootContext.nextInt(6)));
             }
 
             return catches;
@@ -955,289 +1184,320 @@ public class FishingCracker {
 
         private LootContext getLootContext() {
             return new LootContext(((LegacyRandomSource) random).seed.get() ^ 0x5deece66dL, SeedfindingUtil.getMCVersion())
-                .withBiome(SeedfindingUtil.toSeedfindingBiome(level, level.getBiome(BlockPos.containing(pos))))
-                .withOpenWater(inOpenWater)
+                .withBiome(SeedfindingUtil.toSeedfindingBiome(level, level.getBiome(BlockPos.containing(position))))
+                .withOpenWater(openWater)
                 .withLuck(luckLevel);
         }
 
         public void tick() {
-            onBaseTick();
+            if (protocolVersion < MultiVersionCompat.V1_11) {
+                tickLegacy();
+                return;
+            }
+
+            baseTick();
 
             if (this.onGround) {
                 failedReason = "onGround";
             }
 
-            float f = 0.0F;
-            BlockPos blockPos = BlockPos.containing(this.pos);
+            float liquidHeight = 0.0F;
+            BlockPos blockPos = BlockPos.containing(this.position);
             FluidState fluidState = this.level.getFluidState(blockPos);
             if (fluidState.is(FluidTags.WATER)) {
-                f = fluidState.getHeight(this.level, blockPos);
+                liquidHeight = getFluidHeight(fluidState, blockPos);
             }
 
-            boolean bl = f > 0.0F;
-            if (this.state == State.FLYING) {
-                if (bl) {
-                    this.velocity = this.velocity.multiply(0.3D, 0.2D, 0.3D);
-                    this.state = State.BOBBING;
+            boolean isInWater = liquidHeight > 0.0F;
+            if (this.currentState == FishHookState.FLYING) {
+                if (isInWater) {
+                    this.deltaMovement = this.deltaMovement.multiply(0.3D, 0.2D, 0.3D);
+                    this.currentState = FishHookState.BOBBING;
                     return;
                 }
 
-                this.checkForCollision();
+                this.checkCollision();
             } else {
-                if (this.state == State.BOBBING) {
-                    Vec3 vec3 = this.velocity;
-                    double d = this.pos.y + vec3.y - (double) blockPos.getY() - (double) f;
-                    if (Math.abs(d) < 0.01D) {
-                        d += Math.signum(d) * 0.1D;
+                if (this.currentState == FishHookState.BOBBING) {
+                    Vec3 movement = this.deltaMovement;
+                    double force = this.position.y + movement.y - (double) blockPos.getY() - (double) liquidHeight;
+                    if (Math.abs(force) < 0.01D) {
+                        force += Math.signum(force) * 0.1D;
                     }
 
-                    this.velocity = new Vec3(vec3.x * 0.9D, vec3.y - d * (double) this.random.nextFloat() * 0.2D, vec3.z * 0.9D);
-                    if (this.hookCountdown <= 0 && this.fishTravelCountdown <= 0) {
-                        this.inOpenWater = true;
+                    this.deltaMovement = new Vec3(movement.x * 0.9D, movement.y - force * (double) this.random.nextFloat() * 0.2D, movement.z * 0.9D);
+                    if (this.nibble <= 0 && this.timeUntilHooked <= 0) {
+                        this.openWater = true;
                     } else {
-                        this.inOpenWater &= this.outOfOpenWaterTicks < 10 & this.isOpenOrWaterAround(blockPos);
+                        this.openWater &= this.outOfWaterTime < 10 & this.calculateOpenWater(blockPos);
                     }
 
-                    if (bl) {
-                        this.outOfOpenWaterTicks = Math.max(0, this.outOfOpenWaterTicks - 1);
-                        if (this.caughtFish) {
+                    if (isInWater) {
+                        this.outOfWaterTime = Math.max(0, this.outOfWaterTime - 1);
+                        if (this.biting) {
                             // this will just drag the bobber down which we don't care about
-                            //this.velocity = (this.velocity.add(0.0D, -0.1D * (double)this.velocityRandom.nextFloat() * (double)this.velocityRandom.nextFloat(), 0.0D));
+                            //this.deltaMovement = this.deltaMovement.add(0.0D, -0.1D * (double) this.syncronizedRandom.nextFloat() * (double) this.syncronizedRandom.nextFloat(), 0.0D);
                         }
 
-                        this.tickFishingLogic(blockPos);
+                        this.catchingFish(blockPos);
                     } else {
-                        this.outOfOpenWaterTicks = Math.min(10, this.outOfOpenWaterTicks + 1);
+                        this.outOfWaterTime = Math.min(10, this.outOfWaterTime + 1);
                     }
                 }
             }
 
             if (!fluidState.is(FluidTags.WATER)) {
-                this.velocity = this.velocity.add(0.0D, -0.03D, 0.0D);
+                this.deltaMovement = this.deltaMovement.add(0.0D, -0.03D, 0.0D);
             }
 
-            this.move(this.velocity);
-            if (this.state == State.FLYING && (this.onGround || this.horizontalCollision)) {
-                this.velocity = Vec3.ZERO;
+            this.move(this.deltaMovement);
+            if (this.currentState == FishHookState.FLYING && (this.onGround || this.horizontalCollision)) {
+                this.deltaMovement = Vec3.ZERO;
             }
 
-            double e = 0.92D;
-            this.velocity = this.velocity.scale(e);
+            double inertia = 0.92D;
+            this.deltaMovement = this.deltaMovement.scale(inertia);
 
-            boundingBox = FISHING_BOBBER_DIMENSIONS.makeBoundingBox(pos.x, pos.y, pos.z);
+            boundingBox = FISHING_BOBBER_DIMENSIONS.makeBoundingBox(position.x, position.y, position.z);
         }
 
-        private void onBaseTick() {
-            this.updateWaterState();
+        private void baseTick() {
+            this.updateInWaterStateAndDoFluidPushing();
 
-            this.firstUpdate = false;
+            this.firstTick = false;
         }
 
-        private void updateWaterState() {
-            this.checkWaterState();
+        private void updateInWaterStateAndDoFluidPushing() {
+            this.updateInWaterStateAndDoWaterCurrentPushing();
         }
 
-        private void checkWaterState() {
-            if (this.updateMovementInFluid(FluidTags.WATER, 0.014D)) {
-                if (!this.touchingWater && !this.firstUpdate) {
-                    this.onSwimmingStart();
+        private void updateInWaterStateAndDoWaterCurrentPushing() {
+            if (this.updateFluidHeightAndDoFluidPushing(FluidTags.WATER, 0.014D)) {
+                if (!this.wasTouchingWater && !this.firstTick) {
+                    this.doWaterSplashEffect();
                 }
 
-                this.touchingWater = true;
+                this.wasTouchingWater = true;
             } else {
-                if (this.touchingWater) {
+                if (this.wasTouchingWater) {
                     failedReason = "outOfWater";
                 }
-                this.touchingWater = false;
+                this.wasTouchingWater = false;
             }
         }
 
-        private void onSwimmingStart() {
-            float f = 0.2F;
-            Vec3 vec3 = velocity;
-            float g = (float) Math.sqrt(vec3.x * vec3.x * 0.20000000298023224D + vec3.y * vec3.y + vec3.z * vec3.z * 0.20000000298023224D) * f;
-            if (g > 1.0F) {
-                g = 1.0F;
+        private void doWaterSplashEffect() {
+            float volumeModifier = 0.2F;
+            Vec3 movement = deltaMovement;
+            float speed = (float) Math.sqrt(movement.x * movement.x * 0.20000000298023224D + movement.y * movement.y + movement.z * movement.z * 0.20000000298023224D) * volumeModifier;
+            if (speed > 1.0F) {
+                speed = 1.0F;
             }
 
-            if ((double) g < 0.25D) {
+            if ((double) speed < 0.25D) {
                 random.nextFloat();
                 random.nextFloat();
-                //this.playSound(this.getSplashSound(), g, 1.0F + (this.random.nextFloat() - this.random.nextFloat()) * 0.4F);
+                //this.playSound(this.getSwimSplashSound(), speed, 1.0F + (this.random.nextFloat() - this.random.nextFloat()) * 0.4F);
             } else {
                 random.nextFloat();
                 random.nextFloat();
-                //this.playSound(this.getHighSpeedSplashSound(), g, 1.0F + (this.random.nextFloat() - this.random.nextFloat()) * 0.4F);
+                //this.playSound(this.getSwimHighSpeedSplashSound(), speed, 1.0F + (this.random.nextFloat() - this.random.nextFloat()) * 0.4F);
             }
 
-            float h = (float) Mth.floor(this.pos.y);
+            float yt = (float) Mth.floor(this.position.y);
 
-            int j;
-            double k;
-            double l;
-            for (j = 0; (float) j < 1.0F + FISHING_BOBBER_DIMENSIONS.width() * 20.0F; ++j) {
-                k = (this.random.nextDouble() * 2.0D - 1.0D) * (double) FISHING_BOBBER_DIMENSIONS.width();
-                l = (this.random.nextDouble() * 2.0D - 1.0D) * (double) FISHING_BOBBER_DIMENSIONS.width();
-                random.nextDouble();
-                //this.world.addParticle(ParticleTypes.BUBBLE, this.pos.x + k, (double)(h + 1.0F), this.pos.z + l, vec3d.x, vec3d.y - this.random.nextDouble() * 0.20000000298023224D, vec3d.z);
+            for (int i = 0; (float) i < 1.0F + FISHING_BOBBER_DIMENSIONS.width() * 20.0F; ++i) {
+                double xo = (this.nextParticleRandom() * 2.0D - 1.0D) * (double) FISHING_BOBBER_DIMENSIONS.width();
+                double zo = (this.nextParticleRandom() * 2.0D - 1.0D) * (double) FISHING_BOBBER_DIMENSIONS.width();
+                nextParticleRandom();
+                //this.level.addParticle(ParticleTypes.BUBBLE, this.position.x + xo, (double) (yt + 1.0F), this.position.z + zo, movement.x, movement.y - this.random.nextDouble() * 0.20000000298023224D, movement.z);
             }
 
-            for (j = 0; (float) j < 1.0F + FISHING_BOBBER_DIMENSIONS.width() * 20.0F; ++j) {
-                k = (this.random.nextDouble() * 2.0D - 1.0D) * (double) FISHING_BOBBER_DIMENSIONS.width();
-                l = (this.random.nextDouble() * 2.0D - 1.0D) * (double) FISHING_BOBBER_DIMENSIONS.width();
-                //this.world.addParticle(ParticleTypes.SPLASH, this.getX() + k, (double)(h + 1.0F), this.getZ() + l, vec3d.x, vec3d.y, vec3d.z);
+            for (int i = 0; (float) i < 1.0F + FISHING_BOBBER_DIMENSIONS.width() * 20.0F; ++i) {
+                double xo = (this.nextParticleRandom() * 2.0D - 1.0D) * (double) FISHING_BOBBER_DIMENSIONS.width();
+                double zo = (this.nextParticleRandom() * 2.0D - 1.0D) * (double) FISHING_BOBBER_DIMENSIONS.width();
+                //this.level.addParticle(ParticleTypes.SPLASH, this.position.x + xo, (double) (yt + 1.0F), this.position.z + zo, movement.x, movement.y, movement.z);
             }
         }
 
-        private boolean updateMovementInFluid(TagKey<Fluid> tag, double d) {
-            AABB aabb = this.boundingBox.deflate(0.001D);
-            int i = Mth.floor(aabb.minX);
-            int j = Mth.ceil(aabb.maxX);
-            int k = Mth.floor(aabb.minY);
-            int l = Mth.ceil(aabb.maxY);
-            int m = Mth.floor(aabb.minZ);
-            int n = Mth.ceil(aabb.maxZ);
-            if (!this.level.hasChunksAt(i, k, m, j, l, n)) {
+        // in 1.13, the fluid height didn't depend on whether there was fluid above
+        private float getFluidHeight(FluidState fluidState, BlockPos blockPos) {
+            return protocolVersion >= MultiVersionCompat.V1_13 && protocolVersion < MultiVersionCompat.V1_14 ? fluidState.getOwnHeight() : fluidState.getHeight(this.level, blockPos);
+        }
+
+        // Before 1.13, the bounding box was grown by -0.4 vertically, which turns it inside out, and any water in it
+        // counted. The current water doesn't push the bobber.
+        private boolean isInWaterLegacy() {
+            double minY = Math.min(this.boundingBox.minY + 0.4F, this.boundingBox.maxY - 0.4F) + 0.001D;
+            double maxY = Math.max(this.boundingBox.minY + 0.4F, this.boundingBox.maxY - 0.4F) - 0.001D;
+            AABB box = new AABB(this.boundingBox.minX + 0.001D, minY, this.boundingBox.minZ + 0.001D, this.boundingBox.maxX - 0.001D, maxY, this.boundingBox.maxZ - 0.001D);
+            for (BlockPos blockPos : BlockPos.betweenClosed(Mth.floor(box.minX), Mth.floor(box.minY), Mth.floor(box.minZ), Mth.ceil(box.maxX) - 1, Mth.ceil(box.maxY) - 1, Mth.ceil(box.maxZ) - 1)) {
+                if (this.level.getFluidState(blockPos).is(FluidTags.WATER)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // the splash particles used floats before 1.16
+        private double nextParticleRandom() {
+            return protocolVersion >= MultiVersionCompat.V1_16 ? random.nextDouble() : random.nextFloat();
+        }
+
+        private boolean updateFluidHeightAndDoFluidPushing(TagKey<Fluid> tag, double flowScale) {
+            if (protocolVersion < MultiVersionCompat.V1_13) {
+                return isInWaterLegacy();
+            }
+            AABB box = this.boundingBox.deflate(0.001D);
+            int x0 = Mth.floor(box.minX);
+            int x1 = Mth.ceil(box.maxX);
+            int y0 = Mth.floor(box.minY);
+            int y1 = Mth.ceil(box.maxY);
+            int z0 = Mth.floor(box.minZ);
+            int z1 = Mth.ceil(box.maxZ);
+            if (!this.level.hasChunksAt(x0, y0, z0, x1, y1, z1)) {
                 return false;
             } else {
-                double e = 0.0D;
-                boolean bl2 = false;
-                Vec3 vec3 = Vec3.ZERO;
-                int o = 0;
-                BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
+                double height = 0.0D;
+                boolean inFluid = false;
+                Vec3 current = Vec3.ZERO;
+                int currentCount = 0;
+                BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
 
-                for (int p = i; p < j; ++p) {
-                    for (int q = k; q < l; ++q) {
-                        for (int r = m; r < n; ++r) {
-                            mutable.set(p, q, r);
-                            FluidState fluidState = this.level.getFluidState(mutable);
+                for (int x = x0; x < x1; ++x) {
+                    for (int y = y0; y < y1; ++y) {
+                        for (int z = z0; z < z1; ++z) {
+                            mutablePos.set(x, y, z);
+                            FluidState fluidState = this.level.getFluidState(mutablePos);
                             if (fluidState.is(tag)) {
-                                double f = (float) q + fluidState.getHeight(this.level, mutable);
-                                if (f >= aabb.minY) {
-                                    bl2 = true;
-                                    e = Math.max(f - aabb.minY, e);
+                                double fluidTop = (float) y + getFluidHeight(fluidState, mutablePos);
+                                if (fluidTop >= box.minY) {
+                                    inFluid = true;
+                                    height = Math.max(fluidTop - box.minY, height);
                                 }
                             }
                         }
                     }
                 }
 
-                if (vec3.length() > 0.0D) {
-                    if (o > 0) {
-                        vec3 = vec3.scale(1.0D / (double) o);
+                if (current.length() > 0.0D) {
+                    if (currentCount > 0) {
+                        current = current.scale(1.0D / (double) currentCount);
                     }
 
-                    vec3 = vec3.normalize();
+                    current = current.normalize();
 
-                    Vec3 vec33 = this.velocity;
-                    vec3 = vec3.scale(d);
-                    double g = 0.003D;
-                    if (Math.abs(vec33.x) < 0.003D && Math.abs(vec33.z) < 0.003D && vec3.length() < 0.0045000000000000005D) {
-                        vec3 = vec3.normalize().scale(0.0045000000000000005D);
+                    Vec3 movement = this.deltaMovement;
+                    current = current.scale(flowScale);
+                    if (Math.abs(movement.x) < 0.003D && Math.abs(movement.z) < 0.003D && current.length() < 0.0045000000000000005D) {
+                        current = current.normalize().scale(0.0045000000000000005D);
                     }
 
-                    this.velocity = this.velocity.add(vec3);
+                    this.deltaMovement = this.deltaMovement.add(current);
                 }
 
-                return bl2;
+                return inFluid;
             }
         }
 
-        private void checkForCollision() {
-            fakeEntity.absSnapTo(pos.x, pos.y, pos.z);
-            fakeEntity.setDeltaMovement(velocity);
-            HitResult hitResult = ProjectileUtil.getHitResultOnMoveVector(fakeEntity, fakeEntity::canHitEntity);
-            if (hitResult.getType() != HitResult.Type.MISS) {
+        private void checkCollision() {
+            if (this.getHitResultOnMoveVector().getType() != HitResult.Type.MISS) {
                 failedReason = "collision";
             }
         }
 
-        private void move(Vec3 movement) {
+        private HitResult getHitResultOnMoveVector() {
+            fakeEntity.absSnapTo(position.x, position.y, position.z);
+            fakeEntity.setDeltaMovement(deltaMovement);
+            return ProjectileUtil.getHitResultOnMoveVector(fakeEntity, fakeEntity::canHitEntity);
+        }
+
+        private void move(Vec3 delta) {
             assert level != null;
 
-            Vec3 vec3 = this.adjustMovementForCollisions(movement);
-            if (vec3.lengthSqr() > 1.0E-7D) {
-                this.boundingBox = this.boundingBox.move(vec3);
-                this.pos = new Vec3((boundingBox.minX + boundingBox.maxX) / 2.0D, boundingBox.minY, (boundingBox.minZ + boundingBox.maxZ) / 2.0D);
+            Vec3 movement = this.collide(delta);
+            if (movement.lengthSqr() > 1.0E-7D) {
+                this.boundingBox = this.boundingBox.move(movement);
+                this.position = new Vec3((boundingBox.minX + boundingBox.maxX) / 2.0D, boundingBox.minY, (boundingBox.minZ + boundingBox.maxZ) / 2.0D);
             }
 
-            this.horizontalCollision = !Mth.equal(movement.x, vec3.x) || !Mth.equal(movement.z, vec3.z);
-            this.verticalCollision = movement.y != vec3.y;
-            this.onGround = this.verticalCollision && movement.y < 0.0D;
-            //this.fall(vec3d.y, this.onGround, blockState, blockPos);
-            Vec3 vec32 = this.velocity;
-            if (movement.x != vec3.x) {
-                this.velocity = new Vec3(0.0D, vec32.y, vec32.z);
+            this.horizontalCollision = !Mth.equal(delta.x, movement.x) || !Mth.equal(delta.z, movement.z);
+            this.verticalCollision = delta.y != movement.y;
+            this.onGround = this.verticalCollision && delta.y < 0.0D;
+            //this.checkFallDamage(movement.y, this.onGround, state, pos);
+            Vec3 oldDeltaMovement = this.deltaMovement;
+            if (delta.x != movement.x) {
+                this.deltaMovement = new Vec3(0.0D, oldDeltaMovement.y, oldDeltaMovement.z);
             }
 
-            if (movement.z != vec3.z) {
-                this.velocity = new Vec3(vec32.x, vec32.y, 0.0D);
+            if (delta.z != movement.z) {
+                this.deltaMovement = new Vec3(oldDeltaMovement.x, oldDeltaMovement.y, 0.0D);
             }
 
-            if (movement.y != vec3.y) {
-                // block.onLanded
-                velocity = velocity.multiply(1.0D, 0.0D, 1.0D);
+            if (delta.y != movement.y) {
+                // block.updateEntityMovementAfterFallOn
+                deltaMovement = deltaMovement.multiply(1.0D, 0.0D, 1.0D);
             }
 
             if (this.onGround) {
-                // block.onSteppedOn
+                // block.stepOn
             }
 
-            //this.checkBlockCollision(); // no interesting blocks
+            //this.checkInsideBlocks(); // no interesting blocks
 
-            float i = this.getVelocityMultiplier();
-            this.velocity = this.velocity.multiply(i, 1.0D, i);
-            if (this.level.getBlockStatesIfLoaded(this.boundingBox.deflate(0.001D)).anyMatch((blockStatex) -> blockStatex.is(BlockTags.FIRE) || blockStatex.is(Blocks.LAVA))) {
+            float speedFactor = this.getBlockSpeedFactor();
+            this.deltaMovement = this.deltaMovement.multiply(speedFactor, 1.0D, speedFactor);
+            if (this.level.getBlockStatesIfLoaded(this.boundingBox.deflate(0.001D)).anyMatch((state) -> state.is(BlockTags.FIRE) || state.is(Blocks.LAVA))) {
                 failedReason = "fire";
             }
         }
 
-        private Vec3 adjustMovementForCollisions(Vec3 movement) {
+        private Vec3 collide(Vec3 movement) {
             AABB aabb = this.boundingBox;
-            fakeEntity.absSnapTo(pos.x, pos.y, pos.z);
-            fakeEntity.setDeltaMovement(velocity);
+            fakeEntity.absSnapTo(position.x, position.y, position.z);
+            fakeEntity.setDeltaMovement(deltaMovement);
             assert level != null;
 
-            VoxelShape voxelShape = this.level.getWorldBorder().getCollisionShape();
-            List<VoxelShape> voxelShapes = new ArrayList<>();
-            if (!Shapes.joinIsNotEmpty(voxelShape, Shapes.create(aabb.deflate(1.0E-7D)), BooleanOp.AND)) {
-                voxelShapes.add(voxelShape);
+            VoxelShape worldBorderShape = this.level.getWorldBorder().getCollisionShape();
+            List<VoxelShape> colliders = new ArrayList<>();
+            if (!Shapes.joinIsNotEmpty(worldBorderShape, Shapes.create(aabb.deflate(1.0E-7D)), BooleanOp.AND)) {
+                colliders.add(worldBorderShape);
             }
-            voxelShapes.addAll(this.level.getEntityCollisions(fakeEntity, aabb.expandTowards(movement)));
+            colliders.addAll(this.level.getEntityCollisions(fakeEntity, aabb.expandTowards(movement)));
 
-            return movement.lengthSqr() == 0.0D ? movement : Entity.collideBoundingBox(fakeEntity, movement, aabb, this.level, voxelShapes);
+            return movement.lengthSqr() == 0.0D ? movement : Entity.collideBoundingBox(fakeEntity, movement, aabb, this.level, colliders);
         }
 
-        private float getVelocityMultiplier() {
+        private float getBlockSpeedFactor() {
             assert level != null;
-            Block block = this.level.getBlockState(BlockPos.containing(pos)).getBlock();
-            float f = block.getSpeedFactor();
+            Block block = this.level.getBlockState(BlockPos.containing(position)).getBlock();
+            float speedFactorHere = block.getSpeedFactor();
             if (block != Blocks.WATER && block != Blocks.BUBBLE_COLUMN) {
-                return (double) f == 1.0D ? this.level
-                    .getBlockState(BlockPos.containing(this.pos.x, this.boundingBox.minY - 0.5000001D, this.pos.z)).getBlock().getSpeedFactor() : f;
+                return (double) speedFactorHere == 1.0D ? this.level
+                    .getBlockState(BlockPos.containing(this.position.x, this.boundingBox.minY - 0.5000001D, this.position.z)).getBlock().getSpeedFactor() : speedFactorHere;
             } else {
-                return f;
+                return speedFactorHere;
             }
         }
 
-        private boolean isOpenOrWaterAround(BlockPos pos) {
-            PositionType positionType = PositionType.INVALID;
+        private boolean calculateOpenWater(BlockPos blockPos) {
+            OpenWaterType previousLayer = OpenWaterType.INVALID;
 
             boolean valid = true;
 
-            for (int i = -1; i <= 2; ++i) {
-                PositionType positionType2 = this.getPositionType(pos.offset(-2, i, -2), pos.offset(2, i, 2));
-                switch (positionType2) {
+            for (int y = -1; y <= 2; ++y) {
+                OpenWaterType layer = this.getOpenWaterTypeForArea(blockPos.offset(-2, y, -2), blockPos.offset(2, y, 2));
+                switch (layer) {
                     case INVALID:
                         valid = false;
                         break;
                     case ABOVE_WATER:
-                        if (positionType == PositionType.INVALID) {
+                        if (previousLayer == OpenWaterType.INVALID) {
                             valid = false;
                         }
                         break;
                     case INSIDE_WATER:
-                        if (positionType == PositionType.ABOVE_WATER) {
+                        if (previousLayer == OpenWaterType.ABOVE_WATER) {
                             valid = false;
                         }
                         break;
@@ -1248,13 +1508,13 @@ public class FishingCracker {
                     boolean foundWater = false;
                     for (int dx = -2; dx <= 2; dx++) {
                         for (int dz = -2; dz <= 2; dz++) {
-                            BlockPos pos2 = pos.offset(dx, i, dz);
-                            PositionType positionType3 = getPositionType(pos2);
-                            if (positionType3 == PositionType.INVALID) {
-                                openWaterViolations.add(pos2);
-                            } else if (positionType3 == PositionType.ABOVE_WATER) {
-                                aboveWaterBlocks.add(pos2);
-                            } else if (positionType3 == PositionType.INSIDE_WATER) {
+                            BlockPos pos = blockPos.offset(dx, y, dz);
+                            OpenWaterType type = getOpenWaterTypeForBlock(pos);
+                            if (type == OpenWaterType.INVALID) {
+                                openWaterViolations.add(pos);
+                            } else if (type == OpenWaterType.ABOVE_WATER) {
+                                aboveWaterBlocks.add(pos);
+                            } else if (type == OpenWaterType.INSIDE_WATER) {
                                 foundWater = true;
                             }
                         }
@@ -1264,128 +1524,293 @@ public class FishingCracker {
                     }
                 }
 
-                positionType = positionType2;
+                previousLayer = layer;
             }
 
             return valid;
         }
 
-        private PositionType getPositionType(BlockPos start, BlockPos end) {
-            return BlockPos.betweenClosedStream(start, end).map(this::getPositionType).reduce((positionType, positionType2) -> positionType == positionType2 ? positionType : PositionType.INVALID).orElse(PositionType.INVALID);
+        private OpenWaterType getOpenWaterTypeForArea(BlockPos from, BlockPos to) {
+            return BlockPos.betweenClosedStream(from, to).map(this::getOpenWaterTypeForBlock).reduce((a, b) -> a == b ? a : OpenWaterType.INVALID).orElse(OpenWaterType.INVALID);
         }
 
-        private PositionType getPositionType(BlockPos pos) {
+        private OpenWaterType getOpenWaterTypeForBlock(BlockPos pos) {
             assert level != null;
-            BlockState blockState = this.level.getBlockState(pos);
-            if (!blockState.isAir() && !blockState.is(Blocks.LILY_PAD)) {
-                FluidState fluidState = blockState.getFluidState();
-                return fluidState.is(FluidTags.WATER) && fluidState.isSource() && blockState.getCollisionShape(this.level, pos).isEmpty() ? PositionType.INSIDE_WATER : PositionType.INVALID;
+            BlockState state = this.level.getBlockState(pos);
+            if (!state.isAir() && !state.is(Blocks.LILY_PAD)) {
+                FluidState fluidState = state.getFluidState();
+                return fluidState.is(FluidTags.WATER) && fluidState.isSource() && state.getCollisionShape(this.level, pos).isEmpty() ? OpenWaterType.INSIDE_WATER : OpenWaterType.INVALID;
             } else {
-                return PositionType.ABOVE_WATER;
+                return OpenWaterType.ABOVE_WATER;
             }
         }
 
-        private void tickFishingLogic(BlockPos pos) {
+        private void catchingFish(BlockPos blockPos) {
             assert level != null;
-            int i = 1;
-            BlockPos blockPos = pos.above();
-            if (this.random.nextFloat() < 0.25F && this.level.isRainingAt(blockPos)) {
-                ++i;
+            int fishingSpeed = 1;
+            BlockPos above = blockPos.above();
+            if (this.random.nextFloat() < 0.25F && this.level.isRainingAt(above)) {
+                ++fishingSpeed;
             }
 
-            if (this.random.nextFloat() < 0.5F && !this.level.canSeeSky(blockPos)) {
-                --i;
+            if (this.random.nextFloat() < 0.5F && !this.level.canSeeSky(above)) {
+                --fishingSpeed;
             }
 
-            if (this.hookCountdown > 0) {
-                --this.hookCountdown;
-                if (this.hookCountdown <= 0) {
-                    this.waitCountdown = 0;
-                    this.fishTravelCountdown = 0;
-                    this.caughtFish = false;
+            if (this.nibble > 0) {
+                --this.nibble;
+                if (this.nibble <= 0) {
+                    this.timeUntilLured = 0;
+                    this.timeUntilHooked = 0;
+                    this.biting = false;
+                } else if (protocolVersion < MultiVersionCompat.V1_16) {
+                    // the bobber was pulled down using the main random before 1.16
+                    this.deltaMovement = this.deltaMovement.add(0.0D, -0.2D * this.random.nextFloat() * this.random.nextFloat(), 0.0D);
                 }
-            } else {
-                float n;
-                float o;
-                float p;
-                double q;
-                double r;
-                double s;
-                BlockState blockState2;
-                if (this.fishTravelCountdown > 0) {
-                    this.fishTravelCountdown -= i;
-                    if (this.fishTravelCountdown > 0) {
-                        this.fishAngle += random.triangle(0, 9.188);
-                        n = this.fishAngle * 0.017453292F;
-                        o = Mth.sin(n);
-                        p = Mth.cos(n);
-                        q = this.pos.x + (double) (o * (float) this.fishTravelCountdown * 0.1F);
-                        r = (float) Mth.floor(this.pos.y) + 1.0F;
-                        s = this.pos.z + (double) (p * (float) this.fishTravelCountdown * 0.1F);
-                        blockState2 = level.getBlockState(BlockPos.containing(q, r - 1.0D, s));
-                        if (blockState2.is(Blocks.WATER)) {
-                            if (this.random.nextFloat() < 0.15F) {
-                                //serverWorld.spawnParticles(ParticleTypes.BUBBLE, q, r - 0.10000000149011612D, s, 1, (double)o, 0.1D, (double)p, 0.0D);
-                            }
-
-                            float k = o * 0.04F;
-                            float l = p * 0.04F;
-                            //serverWorld.spawnParticles(ParticleTypes.FISHING, q, r, s, 0, (double)l, 0.01D, (double)(-k), 1.0D);
-                            //serverWorld.spawnParticles(ParticleTypes.FISHING, q, r, s, 0, (double)(-l), 0.01D, (double)k, 1.0D);
-                        }
+            } else if (this.timeUntilHooked > 0) {
+                this.timeUntilHooked -= fishingSpeed;
+                if (this.timeUntilHooked > 0) {
+                    if (protocolVersion >= MultiVersionCompat.V1_19) {
+                        this.fishAngle += (float) random.triangle(0, 9.188);
                     } else {
-                        random.nextFloat();
-                        random.nextFloat();
-                        //this.playSound(SoundEvents.ENTITY_FISHING_BOBBER_SPLASH, 0.25F, 1.0F + (this.random.nextFloat() - this.random.nextFloat()) * 0.4F);
-                        double m = this.pos.y + 0.5D;
-                        //serverWorld.spawnParticles(ParticleTypes.BUBBLE, this.getX(), m, this.getZ(), (int)(1.0F + this.getWidth() * 20.0F), (double)this.getWidth(), 0.0D, (double)this.getWidth(), 0.20000000298023224D);
-                        //serverWorld.spawnParticles(ParticleTypes.FISHING, this.getX(), m, this.getZ(), (int)(1.0F + this.getWidth() * 20.0F), (double)this.getWidth(), 0.0D, (double)this.getWidth(), 0.20000000298023224D);
-                        this.hookCountdown = Mth.nextInt(this.random, 20, 40);
-                        this.caughtFish = true;
-                        //this.velocity = new Vec3d(this.velocity.x, (double)(-0.4F * MathHelper.nextFloat(this.velocityRandom, 0.6F, 1.0F)), this.velocity.z);
+                        this.fishAngle += (float) (random.nextGaussian() * 4.0);
                     }
-                } else if (this.waitCountdown > 0) {
-                    this.waitCountdown -= i;
-                    n = 0.15F;
-                    if (this.waitCountdown < 20) {
-                        n = (float) ((double) n + (double) (20 - this.waitCountdown) * 0.05D);
-                    } else if (this.waitCountdown < 40) {
-                        n = (float) ((double) n + (double) (40 - this.waitCountdown) * 0.02D);
-                    } else if (this.waitCountdown < 60) {
-                        n = (float) ((double) n + (double) (60 - this.waitCountdown) * 0.01D);
-                    }
-
-                    if (this.random.nextFloat() < n) {
-                        o = Mth.nextFloat(this.random, 0.0F, 360.0F) * 0.017453292F;
-                        p = Mth.nextFloat(this.random, 25.0F, 60.0F);
-                        q = this.pos.x + (double) (Mth.sin(o) * p * 0.1F);
-                        r = (float) Mth.floor(this.pos.y) + 1.0F;
-                        s = this.pos.z + (double) (Mth.cos(o) * p * 0.1F);
-                        blockState2 = level.getBlockState(BlockPos.containing(q, r - 1.0D, s));
-                        if (blockState2.is(Blocks.WATER)) {
-                            random.nextInt(2);
-                            //serverWorld.spawnParticles(ParticleTypes.SPLASH, q, r, s, 2 + this.random.nextInt(2), 0.10000000149011612D, 0.0D, 0.10000000149011612D, 0.0D);
+                    float angle = this.fishAngle * 0.017453292F;
+                    float angleSin = Mth.sin(angle);
+                    float angleCos = Mth.cos(angle);
+                    double fishX = this.position.x + (double) (angleSin * (float) this.timeUntilHooked * 0.1F);
+                    double fishY = (float) Mth.floor(this.position.y) + 1.0F;
+                    double fishZ = this.position.z + (double) (angleCos * (float) this.timeUntilHooked * 0.1F);
+                    BlockState splashBlockState = level.getBlockState(BlockPos.containing(fishX, fishY - 1.0D, fishZ));
+                    if (splashBlockState.is(Blocks.WATER)) {
+                        if (this.random.nextFloat() < 0.15F) {
+                            //serverLevel.sendParticles(ParticleTypes.BUBBLE, fishX, fishY - 0.10000000149011612D, fishZ, 1, angleSin, 0.1D, angleCos, 0.0D);
                         }
-                    }
 
-                    if (this.waitCountdown <= 0) {
-                        this.fishAngle = Mth.nextFloat(this.random, 0.0F, 360.0F);
-                        this.fishTravelCountdown = Mth.nextInt(this.random, 20, 80);
+                        float particleXMovement = angleSin * 0.04F;
+                        float particleZMovement = angleCos * 0.04F;
+                        //serverLevel.sendParticles(ParticleTypes.FISHING, fishX, fishY, fishZ, 0, particleZMovement, 0.01D, -particleXMovement, 1.0D);
+                        //serverLevel.sendParticles(ParticleTypes.FISHING, fishX, fishY, fishZ, 0, -particleZMovement, 0.01D, particleXMovement, 1.0D);
                     }
                 } else {
-                    this.waitCountdown = Mth.nextInt(this.random, 100, 600);
-                    this.waitCountdown -= this.lureLevel * 20 * 5;
+                    if (protocolVersion < MultiVersionCompat.V1_16) {
+                        // the bobber was pulled down using the main random before 1.16
+                        this.deltaMovement = new Vec3(this.deltaMovement.x, -0.4F * Mth.nextFloat(this.random, 0.6F, 1.0F), this.deltaMovement.z);
+                    }
+                    random.nextFloat();
+                    random.nextFloat();
+                    //this.playSound(SoundEvents.FISHING_BOBBER_SPLASH, 0.25F, 1.0F + (this.random.nextFloat() - this.random.nextFloat()) * 0.4F);
+                    double y = this.position.y + 0.5D;
+                    //serverLevel.sendParticles(ParticleTypes.BUBBLE, this.getX(), y, this.getZ(), (int) (1.0F + this.getBbWidth() * 20.0F), this.getBbWidth(), 0.0D, this.getBbWidth(), 0.20000000298023224D);
+                    //serverLevel.sendParticles(ParticleTypes.FISHING, this.getX(), y, this.getZ(), (int) (1.0F + this.getBbWidth() * 20.0F), this.getBbWidth(), 0.0D, this.getBbWidth(), 0.20000000298023224D);
+                    this.nibble = Mth.nextInt(this.random, 20, 40);
+                    this.biting = true;
+                }
+            } else if (this.timeUntilLured > 0) {
+                this.timeUntilLured -= fishingSpeed;
+                float teaseChance = 0.15F;
+                if (this.timeUntilLured < 20) {
+                    teaseChance = (float) ((double) teaseChance + (double) (20 - this.timeUntilLured) * 0.05D);
+                } else if (this.timeUntilLured < 40) {
+                    teaseChance = (float) ((double) teaseChance + (double) (40 - this.timeUntilLured) * 0.02D);
+                } else if (this.timeUntilLured < 60) {
+                    teaseChance = (float) ((double) teaseChance + (double) (60 - this.timeUntilLured) * 0.01D);
+                }
+
+                if (this.random.nextFloat() < teaseChance) {
+                    float angle = Mth.nextFloat(this.random, 0.0F, 360.0F) * 0.017453292F;
+                    float dist = Mth.nextFloat(this.random, 25.0F, 60.0F);
+                    double fishX = this.position.x + (double) (Mth.sin(angle) * dist * 0.1F);
+                    double fishY = (float) Mth.floor(this.position.y) + 1.0F;
+                    double fishZ = this.position.z + (double) (Mth.cos(angle) * dist * 0.1F);
+                    // the position was truncated rather than floored before 1.14.1
+                    BlockPos splashPos = protocolVersion >= MultiVersionCompat.V1_14_1 ? BlockPos.containing(fishX, fishY - 1.0D, fishZ) : new BlockPos((int) fishX, (int) fishY - 1, (int) fishZ);
+                    BlockState splashBlockState = level.getBlockState(splashPos);
+                    if (splashBlockState.is(Blocks.WATER)) {
+                        random.nextInt(2);
+                        //serverLevel.sendParticles(ParticleTypes.SPLASH, fishX, fishY, fishZ, 2 + this.random.nextInt(2), 0.10000000149011612D, 0.0D, 0.10000000149011612D, 0.0D);
+                    }
+                }
+
+                if (this.timeUntilLured <= 0) {
+                    this.fishAngle = Mth.nextFloat(this.random, 0.0F, 360.0F);
+                    this.timeUntilHooked = Mth.nextInt(this.random, 20, 80);
+                }
+            } else {
+                this.timeUntilLured = Mth.nextInt(this.random, 100, 600);
+                this.timeUntilLured -= this.lureLevel * 20 * 5;
+            }
+        }
+
+        // the fishing bobber before 1.11, which floated depending on how much of it was in water, and had no states
+        private void tickLegacy() {
+            baseTick();
+
+            // The bobber gets stuck in any block it hits, but the block it's stuck in isn't stored, so it comes unstuck
+            // on the next tick, slowing down randomly
+            if (this.inGroundLegacy) {
+                this.inGroundLegacy = false;
+                double xa = this.deltaMovement.x * (this.random.nextFloat() * 0.2F);
+                double ya = this.deltaMovement.y * (this.random.nextFloat() * 0.2F);
+                double za = this.deltaMovement.z * (this.random.nextFloat() * 0.2F);
+                this.deltaMovement = new Vec3(xa, ya, za);
+            }
+
+            HitResult hitResult = this.getHitResultOnMoveVector();
+            if (hitResult.getType() == HitResult.Type.ENTITY) {
+                failedReason = "collision";
+                return;
+            }
+            if (hitResult.getType() == HitResult.Type.BLOCK) {
+                this.inGroundLegacy = true;
+                return;
+            }
+
+            Vec3 oldPosition = this.position;
+            this.move(this.deltaMovement);
+            this.updateStepsLegacy(oldPosition);
+
+            double submerged = 0;
+            for (int i = 0; i < 5; i++) {
+                double minY = this.boundingBox.minY + (this.boundingBox.maxY - this.boundingBox.minY) * i / 5;
+                double maxY = this.boundingBox.minY + (this.boundingBox.maxY - this.boundingBox.minY) * (i + 1) / 5;
+                if (isInWaterLegacy(new AABB(this.boundingBox.minX, minY, this.boundingBox.minZ, this.boundingBox.maxX, maxY, this.boundingBox.maxZ))) {
+                    submerged += 1.0 / 5;
+                }
+            }
+
+            if (submerged > 0) {
+                this.catchingFishLegacy(BlockPos.containing(this.position));
+            }
+
+            float inertia = this.onGround || this.horizontalCollision ? 0.5F : 0.92F;
+            double ya = this.deltaMovement.y + 0.04F * (submerged * 2 - 1);
+            if (submerged > 0) {
+                inertia = (float) (inertia * 0.9);
+                ya *= 0.8;
+            }
+            this.deltaMovement = new Vec3(this.deltaMovement.x * inertia, ya * inertia, this.deltaMovement.z * inertia);
+
+            this.boundingBox = FISHING_BOBBER_DIMENSIONS.makeBoundingBox(this.position.x, this.position.y, this.position.z);
+        }
+
+        // Before 1.11, the bobber made step sounds like a walking entity, and swimming sounds in water, which use its random
+        private void updateStepsLegacy(Vec3 oldPosition) {
+            double dx = this.position.x - oldPosition.x;
+            double dz = this.position.z - oldPosition.z;
+            this.moveDistLegacy = (float) (this.moveDistLegacy + (float) Math.sqrt(dx * dx + dz * dz) * 0.6);
+            BlockPos posBelow = BlockPos.containing(this.position.x, this.position.y - 0.2F, this.position.z);
+            BlockState stateBelow = this.level.getBlockState(posBelow);
+            if (stateBelow.isAir()) {
+                BlockState stateBelow2 = this.level.getBlockState(posBelow.below());
+                if (stateBelow2.is(BlockTags.FENCES) || stateBelow2.is(BlockTags.WALLS) || stateBelow2.is(BlockTags.FENCE_GATES)) {
+                    stateBelow = stateBelow2;
+                }
+            }
+            if (this.moveDistLegacy > this.nextStepLegacy && !stateBelow.isAir()) {
+                this.nextStepLegacy = (int) this.moveDistLegacy + 1;
+                if (this.wasTouchingWater) {
+                    // swimming sound pitch
+                    this.random.nextFloat();
+                    this.random.nextFloat();
                 }
             }
         }
 
-        private enum PositionType {
+        // whether any water in the box is above its bottom, where water source blocks count as full blocks
+        private boolean isInWaterLegacy(AABB box) {
+            for (BlockPos blockPos : BlockPos.betweenClosed(Mth.floor(box.minX), Mth.floor(box.minY), Mth.floor(box.minZ), Mth.ceil(box.maxX) - 1, Mth.ceil(box.maxY) - 1, Mth.ceil(box.maxZ) - 1)) {
+                FluidState fluidState = this.level.getFluidState(blockPos);
+                if (fluidState.is(FluidTags.WATER)) {
+                    double fluidTop = blockPos.getY() + 1 - (fluidState.isSource() ? 0 : (8 - fluidState.getAmount()) / 8.0);
+                    if (fluidTop >= box.minY) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private void catchingFishLegacy(BlockPos blockPos) {
+            int fishingSpeed = 1;
+            BlockPos above = blockPos.above();
+            if (this.random.nextFloat() < 0.25F && this.level.isRainingAt(above)) {
+                fishingSpeed = 2;
+            }
+
+            if (this.random.nextFloat() < 0.5F && !this.level.canSeeSky(above)) {
+                --fishingSpeed;
+            }
+
+            if (this.nibble > 0) {
+                --this.nibble;
+                if (this.nibble <= 0) {
+                    this.timeUntilLured = 0;
+                    this.timeUntilHooked = 0;
+                }
+            } else if (this.timeUntilHooked > 0) {
+                this.timeUntilHooked -= fishingSpeed;
+                if (this.timeUntilHooked <= 0) {
+                    this.deltaMovement = this.deltaMovement.add(0.0D, -0.2F, 0.0D);
+                    random.nextFloat();
+                    random.nextFloat();
+                    //this.playSound(SoundEvents.ENTITY_BOBBER_SPLASH, 0.25F, 1.0F + (this.rand.nextFloat() - this.rand.nextFloat()) * 0.4F);
+                    this.nibble = Mth.nextInt(this.random, 10, 30);
+                } else {
+                    this.fishAngle += (float) (this.random.nextGaussian() * 4.0D);
+                    float angle = this.fishAngle * 0.017453292F;
+                    double fishX = this.position.x + (double) (Mth.sin(angle) * (float) this.timeUntilHooked * 0.1F);
+                    double fishY = (float) Mth.floor(this.boundingBox.minY) + 1.0F;
+                    double fishZ = this.position.z + (double) (Mth.cos(angle) * (float) this.timeUntilHooked * 0.1F);
+                    if (this.level.getBlockState(new BlockPos((int) fishX, (int) fishY - 1, (int) fishZ)).is(Blocks.WATER)) {
+                        this.random.nextFloat();
+                        //worldserver.spawnParticle(EnumParticleTypes.WATER_BUBBLE, ...);
+                    }
+                }
+            } else if (this.timeUntilLured > 0) {
+                this.timeUntilLured -= fishingSpeed;
+                float teaseChance = 0.15F;
+                if (this.timeUntilLured < 20) {
+                    teaseChance = (float) ((double) teaseChance + (double) (20 - this.timeUntilLured) * 0.05D);
+                } else if (this.timeUntilLured < 40) {
+                    teaseChance = (float) ((double) teaseChance + (double) (40 - this.timeUntilLured) * 0.02D);
+                } else if (this.timeUntilLured < 60) {
+                    teaseChance = (float) ((double) teaseChance + (double) (60 - this.timeUntilLured) * 0.01D);
+                }
+
+                if (this.random.nextFloat() < teaseChance) {
+                    float angle = Mth.nextFloat(this.random, 0.0F, 360.0F) * 0.017453292F;
+                    float dist = Mth.nextFloat(this.random, 25.0F, 60.0F);
+                    double fishX = this.position.x + (double) (Mth.sin(angle) * dist * 0.1F);
+                    double fishY = (float) Mth.floor(this.boundingBox.minY) + 1.0F;
+                    double fishZ = this.position.z + (double) (Mth.cos(angle) * dist * 0.1F);
+                    if (this.level.getBlockState(new BlockPos((int) fishX, (int) fishY - 1, (int) fishZ)).is(Blocks.WATER)) {
+                        this.random.nextInt(2);
+                        //worldserver.spawnParticle(EnumParticleTypes.WATER_SPLASH, ...);
+                    }
+                }
+
+                if (this.timeUntilLured <= 0) {
+                    this.fishAngle = Mth.nextFloat(this.random, 0.0F, 360.0F);
+                    this.timeUntilHooked = Mth.nextInt(this.random, 20, 80);
+                }
+            } else {
+                this.timeUntilLured = Mth.nextInt(this.random, 100, 900);
+                this.timeUntilLured -= this.lureLevel * 20 * 5;
+            }
+
+            if (this.nibble > 0) {
+                this.deltaMovement = this.deltaMovement.add(0.0D, -(double) (this.random.nextFloat() * this.random.nextFloat() * this.random.nextFloat()) * 0.2D, 0.0D);
+            }
+        }
+
+        private enum OpenWaterType {
             ABOVE_WATER,
             INSIDE_WATER,
             INVALID;
         }
 
-        private enum State {
+        private enum FishHookState {
             FLYING,
             BOBBING;
         }

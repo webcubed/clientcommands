@@ -7,15 +7,18 @@ import com.mojang.brigadier.tree.LiteralCommandNode;
 import com.mojang.logging.LogUtils;
 import dev.xpple.betterconfig.api.BetterConfigAPI;
 import dev.xpple.betterconfig.api.ModConfigBuilder;
+import dev.xpple.betterconfig.api.ModConfigSide;
 import dev.xpple.simplewaypoints.api.SimpleWaypointsAPI;
 import net.earthcomputer.clientcommands.command.*;
 import net.earthcomputer.clientcommands.event.ClientConnectionEvents;
+import net.earthcomputer.clientcommands.features.ChorusManipulation;
 import net.earthcomputer.clientcommands.features.CommandExecutionCustomPayload;
 import net.earthcomputer.clientcommands.features.EnchantmentCracker;
 import net.earthcomputer.clientcommands.features.FishingCracker;
 import net.earthcomputer.clientcommands.features.PlayerRandCracker;
 import net.earthcomputer.clientcommands.features.Relogger;
 import net.earthcomputer.clientcommands.features.ServerBrandManager;
+import net.earthcomputer.clientcommands.features.ServerPermissions;
 import net.earthcomputer.clientcommands.features.Waypoints;
 import net.earthcomputer.clientcommands.render.RenderQueue;
 import net.fabricmc.api.ClientModInitializer;
@@ -64,7 +67,7 @@ public class ClientCommands implements ClientModInitializer {
             LOGGER.error("Failed to create config dir", e);
         }
 
-        new ModConfigBuilder<>("clientcommands", Configs.class).build();
+        new ModConfigBuilder<>("clientcommands", Configs.class).setSide(ModConfigSide.CLIENT).build();
         ClientConnectionEvents.DISCONNECT.register(() -> {
             if (!Relogger.isRelogging) {
                 BetterConfigAPI.getInstance().getModConfig("clientcommands").resetTemporaryConfigs();
@@ -80,11 +83,14 @@ public class ClientCommands implements ClientModInitializer {
 
         // Events
         ClientCommandRegistrationCallback.EVENT.register(ClientCommands::registerCommands);
+        ChorusManipulation.registerEvents();
         Donate.registerEvents();
+        FindItemCommand.registerEvents();
         EnchantmentCracker.registerEvents();
         FishingCracker.registerEvents();
         PlayerRandCracker.registerEvents();
         ServerBrandManager.registerEvents();
+        ServerPermissions.registerEvents();
     }
 
     private static void setupScrambleWindowTitle() {
@@ -151,6 +157,7 @@ public class ClientCommands implements ClientModInitializer {
         CTellRawCommand.register(dispatcher, context);
         CTimeCommand.register(dispatcher);
         CTitleCommand.register(dispatcher, context);
+        FindBiomeCommand.register(dispatcher, context);
         FindBlockCommand.register(dispatcher, context);
         FindCommand.register(dispatcher);
         FindItemCommand.register(dispatcher, context);

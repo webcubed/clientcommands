@@ -14,15 +14,6 @@ base {
 	archivesName = project.archives_base_name
 }
 
-sourceSets {
-	codeGen
-}
-
-configurations {
-	includedLibrary
-	implementation.extendsFrom includedLibrary
-}
-
 repositories {
 	maven {
 		url = 'https://maven.seedfinding.com'
@@ -39,10 +30,88 @@ repositories {
 	maven {
 		url = "https://maven.parchmentmc.org"
 	}
+	maven {
+		url = 'https://repo.viaversion.com'
+		content {
+			includeGroup 'com.viaversion'
+		}
+	}
 }
 
 loom {
+	splitEnvironmentSourceSets()
 	accessWidenerPath = file('src/main/resources/clientcommands.aw')
+
+	mods {
+		clientcommands {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+// Loom calls the server-side source set "main" and the client-only source set "client". Since we're primarily a
+// client-side mod, the client code lives in src/main and the code that also runs on the server lives in src/common.
+// The client code can access the common code, but not vice versa.
+// TODO: add customization option to loom to rename the source sets instead
+sourceSets {
+	main {
+		java.srcDirs = ['src/common/java']
+		resources.srcDirs = ['src/common/resources']
+	}
+	client {
+		java.srcDirs = ['src/main/java']
+		resources.srcDirs = ['src/main/resources']
+	}
+	codeGen
+	// Client gametests that are run against vanilla servers of older versions. These are separate from the regular
+	// gametests so that ViaFabricPlus is only installed for these tests.
+	oldServerGametest {
+		compileClasspath += main.output + client.output
+		runtimeClasspath += main.output + client.output
+	}
+}
+
+configurations {
+	includedLibrary
+	clientImplementation.extendsFrom includedLibrary
+	oldServerGametestCompileClasspath.extendsFrom clientCompileClasspath
+	oldServerGametestRuntimeClasspath.extendsFrom clientRuntimeClasspath
+	oldServerTestMatrixRuntimeOnly
+}
+
+loom {
+	mods {
+		'clientcommands-old-server-test' {
+			sourceSet sourceSets.oldServerGametest
+		}
+	}
+}
+
+fabricApi {
+	configureTests {
+		modId = "clientcommands-test"
+		enableGameTests = false
+		enableClientGameTests = true
+		createSourceSet = true
+	}
+}
+
+loom.runs {
+	oldServerClientGameTest {
+		inherit clientGameTest
+		sourceSet = sourceSets.oldServerGametest.name
+		runDirectory = file('build/run/oldServerClientGameTest')
+		systemProperties.put('fabric.client.gametest.testModResourcesPath', file('src/oldServerGametest/resources').absolutePath)
+		// downloaded server jars are kept outside the build directory so that they survive a clean
+		systemProperties.put('clientcommands.oldServerTest.cacheDir', new File(gradle.gradleUserHomeDir, 'caches/clientcommands-old-servers').absolutePath)
+		if (project.hasProperty('oldServerVersions')) {
+			// e.g. -PoldServerVersions=1.8.9,1.12.2 to only test against those versions
+			systemProperties.put('clientcommands.oldServerTest.versions', project.property('oldServerVersions').toString())
+		}
+		// the player name needs to be known, and the servers run in offline mode anyway
+		systemProperties.put('devauth.enabled', 'false')
+	}
 }
 
 loom.runs.configureEach {
@@ -55,9 +124,9 @@ dependencies {
 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
-	include implementation("dev.xpple:clientarguments:${project.clientarguments_version}")
+	include clientImplementation("dev.xpple:clientarguments:${project.clientarguments_version}")
 	include implementation("dev.xpple:betterconfig-fabric:${project.betterconfig_version}")
-	include implementation("dev.xpple:simplewaypoints:${project.simplewaypoints_version}")
+	include clientImplementation("dev.xpple:simplewaypoints:${project.simplewaypoints_version}")
 
 	includedLibrary "com.seedfinding:mc_feature:${project.seedfinding_feature_version}"
 	includedLibrary "com.seedfinding:mc_biome:${project.seedfinding_biome_version}"
@@ -71,11 +140,28 @@ dependencies {
 
 	compileOnly 'com.demonwav.mcdev:annotations:2.0.0'
 
-	runtimeOnly("me.djtheredstoner:DevAuth-fabric:${project.devauth_version}") {
+	clientRuntimeOnly("me.djtheredstoner:DevAuth-fabric:${project.devauth_version}") {
 		exclude group: 'net.fabricmc', module: 'fabric-loader'
 	}
 
-	codeGenImplementation sourceSets.main.output
+	codeGenImplementation sourceSets.client.output
+
+	// ViaFabricPlus bundles its dependencies, and its transitive dependencies would otherwise change the versions of
+	// Fabric Loader and Fabric API
+	oldServerGametestRuntimeOnly("com.viaversion:viafabricplus:${project.viafabricplus_version}") {
+		transitive = false
+	}
+	oldServerGametestCompileOnly("com.viaversion:viafabricplus-api:${project.viafabricplus_version}") {
+		transitive = false
+	}
+	oldServerGametestCompileOnly("com.viaversion:viaversion-api:${project.viaversion_version}") {
+		transitive = false
+	}
+	oldServerGametestImplementation "net.fabricmc:mapping-io:${project.mapping_io_version}"
+	// ViaVersion is otherwise only available nested inside ViaFabricPlus, which only works when the game is running
+	oldServerTestMatrixRuntimeOnly("com.viaversion:viaversion-api:${project.viaversion_version}") {
+		transitive = false
+	}
 
 	testImplementation "net.fabricmc:fabric-loader-junit:${project.loader_version}"
 	testImplementation "org.junit.jupiter:junit-jupiter:${project.junit_version}"
@@ -103,22 +189,40 @@ jar {
 	manifest.attributes 'Main-Class': 'net.earthcomputer.clientcommands.DoubleClickMain'
 }
 
+tasks.register('deleteOldServerGameTestRunDir', Delete) {
+	delete loom.runs.oldServerClientGameTest.runDirectory
+}
+
+tasks.named('runOldServerClientGameTest') {
+	dependsOn deleteOldServerGameTestRunDir
+}
+
+// writes the GitHub Actions matrix that splits the old server gametests between parallel jobs
+tasks.register('writeOldServerTestMatrix', JavaExec) {
+	classpath = sourceSets.oldServerGametest.runtimeClasspath + configurations.oldServerTestMatrixRuntimeOnly
+	mainClass = 'net.earthcomputer.clientcommands.oldservergametest.WriteTestMatrix'
+	args file('build/old_server_test_matrix.json').absolutePath
+	if (project.hasProperty('oldServerVersions')) {
+		systemProperty('clientcommands.oldServerTest.versions', project.property('oldServerVersions').toString())
+	}
+}
+
 tasks.register('generateBuildInfo', GenerateBuildInfoTask) {
 	outputFile = new File(temporaryDir, "build_info.json")
 }
 
-processResources {
+processClientResources {
 	inputs.property "version", project.version
 	inputs.property "mcversion", project.minecraft_version_dependency
 
 	duplicatesStrategy DuplicatesStrategy.WARN
 
-	from(sourceSets.main.resources.srcDirs) {
+	from(sourceSets.client.resources.srcDirs) {
 		include "fabric.mod.json"
 		expand "version": project.version, "mcversion": project.minecraft_version_dependency
 	}
 
-	from(sourceSets.main.resources.srcDirs) {
+	from(sourceSets.client.resources.srcDirs) {
 		exclude "fabric.mod.json"
 	}
 
@@ -172,6 +276,7 @@ modrinth {
 	projectId = 'client-commands'
 	uploadFile = jar
 	gameVersions.set(project.minecraft_version_list.split('\\s*,\\s*').toList())
+	environment = 'client_only_server_optional'
 	loaders.set(['fabric', 'quilt'])
 	changelog = changelogText
 	dependencies {

@@ -48,6 +48,7 @@ import net.minecraft.world.item.enchantment.EnchantmentInstance;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.EnchantingTableBlock;
+import org.jetbrains.annotations.VisibleForTesting;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 
@@ -125,6 +126,7 @@ public class EnchantmentCracker {
         ClientLevelEvents.UNLOAD_LEVEL.register(isDisconnect -> {
             if (isDisconnect) {
                 expectedNumBookshelves = -1;
+                resetCracker();
             }
         });
         PlayerRandCracker.RNG_CALLED_EVENT.register(EnchantmentCracker::onRNGCallEvent);
@@ -214,6 +216,13 @@ public class EnchantmentCracker {
     public static void resetCracker() {
         Configs.enchCrackState = CrackState.UNCRACKED;
         possibleXPSeeds.clear();
+    }
+
+    @VisibleForTesting
+    public static void setKnownXpSeed(int xpSeed) {
+        possibleXPSeeds.clear();
+        possibleXPSeeds.add(xpSeed);
+        Configs.enchCrackState = CrackState.CRACKED;
     }
 
     public static void checkXpSeedState(EnchantmentMenu menu) {

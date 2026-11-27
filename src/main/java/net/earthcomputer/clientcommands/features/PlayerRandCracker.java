@@ -2,12 +2,12 @@ package net.earthcomputer.clientcommands.features;
 
 import com.demonwav.mcdev.annotations.Translatable;
 import net.earthcomputer.clientcommands.Configs;
-import net.earthcomputer.clientcommands.util.CUtil;
-import net.earthcomputer.clientcommands.util.CComponentUtil;
-import net.earthcomputer.clientcommands.util.MultiVersionCompat;
 import net.earthcomputer.clientcommands.command.ClientCommandHelper;
 import net.earthcomputer.clientcommands.event.ClientLevelEvents;
 import net.earthcomputer.clientcommands.interfaces.ICreativeSlot;
+import net.earthcomputer.clientcommands.util.CComponentUtil;
+import net.earthcomputer.clientcommands.util.CUtil;
+import net.earthcomputer.clientcommands.util.MultiVersionCompat;
 import net.fabricmc.fabric.api.event.Event;
 import net.fabricmc.fabric.api.event.EventFactory;
 import net.minecraft.ChatFormatting;
@@ -20,7 +20,9 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.sounds.SoundEvents;
+import net.minecraft.tags.ItemTags;
 import net.minecraft.util.Prediction;
+import net.minecraft.util.RandomSource;
 import net.minecraft.util.StringRepresentable;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.inventory.ContainerInput;
@@ -30,10 +32,14 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.ItemUseAnimation;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.Consumable;
+import net.minecraft.world.item.consume_effects.ApplyStatusEffectsConsumeEffect;
+import net.minecraft.world.item.consume_effects.ConsumeEffect;
+import net.minecraft.world.item.consume_effects.TeleportRandomlyConsumeEffect;
 import net.minecraft.world.item.enchantment.EnchantmentEffectComponents;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.item.equipment.Equippable;
+import net.minecraft.world.level.levelgen.LegacyRandomSource;
 import net.minecraft.world.phys.Vec3;
 import org.jspecify.annotations.Nullable;
 
@@ -161,35 +167,75 @@ public class PlayerRandCracker {
         };
 
         if (canMaintainPlayerRNG(callType)) {
-            if (itemUseTimeLeft < 0 && particleCount != 16) {
-                // We have accounted for all eating ticks, that on the server should be calculated
+            if (itemUseTimeLeft <= 0 && particleCount != 16) {
+                // We have accounted for all eating ticks, that on the server should be calculated.
+                // The server finishes using the item with 1 tick left, but the client may tick once more before it finds out.
                 // Sometimes if the connection is laggy we eat more than 24 ticks so just hope for the best
                 return;
             }
 
-            // random calls for the consume sounds
-            for (int i = 0; i < 3; i++) {
-                nextInt();
-            }
-            if (consumable.hasConsumeParticles()) {
-                // random calls for the particles
-                for (int i = 0; i < particleCount * 3; i++) {
-                    nextInt();
-                }
+            if (particleCount != 16 && Configs.chorusManipulation) {
+                // must be before this tick's random calls, as it may throw items, which the server will see first
+                ChorusManipulation.onEat(pos, itemUseTimeLeft, stack, consumable);
             }
 
-            if (Configs.chorusManipulation && stack.getItem() == Items.CHORUS_FRUIT) {
-                ChorusManipulation.onEat(pos, particleCount, itemUseTimeLeft);
-                if (particleCount == 16) {
-                    //Consumption randoms
-                    for (int i = 0; i < 5; i++) {
-                        nextInt();
-                    }
-                }
+            int consumeRandomCalls = getConsumeRandomCalls(stack, particleCount, consumable);
+            for (int i = 0; i < consumeRandomCalls; i++) {
+                nextInt();
             }
         } else {
             resetCracker(callType, false);
         }
+
+        if (particleCount == 16) {
+            onConsumeEffects(pos, consumable);
+        }
+    }
+
+    private static void onConsumeEffects(Vec3 pos, Consumable consumable) {
+        int protocolVersion = MultiVersionCompat.INSTANCE.getProtocolVersion();
+
+        for (ConsumeEffect effect : consumable.onConsumeEffects()) {
+            if (effect instanceof ApplyStatusEffectsConsumeEffect applyEffects && protocolVersion >= MultiVersionCompat.V1_20_5) {
+                // Before 1.21.2, each status effect of a food had its own probability, so was rolled separately.
+                // Before 1.20.5, the level random was used instead.
+                int randomCalls = protocolVersion >= MultiVersionCompat.V1_21_2 ? 1 : applyEffects.effects().size();
+                if (canMaintainPlayerRNG(RNGCallType.CONSUME_STATUS_EFFECTS)) {
+                    for (int i = 0; i < randomCalls; i++) {
+                        nextFloat();
+                    }
+                } else {
+                    resetCracker(RNGCallType.CONSUME_STATUS_EFFECTS, false);
+                }
+            } else if (effect instanceof TeleportRandomlyConsumeEffect teleport) {
+                if (canMaintainPlayerRNG(RNGCallType.TELEPORT)) {
+                    LegacyRandomSource rand = new LegacyRandomSource(0);
+                    rand.seed.set(seed);
+                    ChorusManipulation.simulateTeleport(rand, pos, teleport.diameter());
+                    seed = rand.seed.get();
+                } else {
+                    resetCracker(RNGCallType.TELEPORT, false);
+                }
+            }
+        }
+    }
+
+    // The number of random calls made when the consume particles and sounds are emitted
+    public static int getConsumeRandomCalls(ItemStack stack, int particleCount, Consumable consumable) {
+        int protocolVersion = MultiVersionCompat.INSTANCE.getProtocolVersion();
+
+        // random calls for the consume sounds
+        int randomCalls = protocolVersion >= MultiVersionCompat.V1_21_2 ? 4 : 3;
+        if (consumable.hasConsumeParticles()) {
+            // random calls for the particles
+            int particleRandomCalls = protocolVersion >= MultiVersionCompat.V1_21_11 ? 4 : 3;
+            randomCalls += particleCount * particleRandomCalls;
+        }
+        if (particleCount == 16 && protocolVersion >= MultiVersionCompat.V1_21_2 && stack.has(DataComponents.FOOD)) {
+            // random calls for the eating sound and burp sound once the food has been eaten
+            randomCalls += 3;
+        }
+        return randomCalls;
     }
 
     public static void onEquipItem() {
@@ -211,12 +257,23 @@ public class PlayerRandCracker {
         }
     }
 
-    public static void onCrossbowUse() {
+    public static void onCrossbowUse(int projectileCount) {
         if (canMaintainPlayerRNG(RNGCallType.CROSSBOW)) {
-            if (MultiVersionCompat.INSTANCE.getProtocolVersion() <= MultiVersionCompat.V1_18_2) {
+            int protocolVersion = MultiVersionCompat.INSTANCE.getProtocolVersion();
+            int randomCalls;
+            if (protocolVersion >= MultiVersionCompat.V1_20_5) {
+                // a random sound pitch for each projectile after the first
+                randomCalls = Math.max(0, projectileCount - 1);
+            } else if (protocolVersion >= MultiVersionCompat.V1_17) {
+                // a random boolean and two random sound pitches, regardless of the number of projectiles
+                randomCalls = 3;
+            } else {
+                // a random boolean, the sound pitches used a different random
+                randomCalls = 1;
+            }
+            for (int i = 0; i < randomCalls; i++) {
                 nextInt();
             }
-            nextInt();
         } else {
             resetCracker(RNGCallType.CROSSBOW, false);
         }
@@ -226,6 +283,25 @@ public class PlayerRandCracker {
         if (MultiVersionCompat.INSTANCE.getProtocolVersion() >= MultiVersionCompat.V1_17) {
             // TODO: is there a way to be smarter about this?
             resetCracker(RNGCallType.XP);
+        }
+    }
+
+    private static final double SHIELD_DISABLE_RANGE = 8;
+
+    public static void onBlockingTick(LocalPlayer player) {
+        // Before 1.20.5, a player blocking an attack from an axe had a random chance to have their shield disabled.
+        // We can't reliably tell when the server blocks an attack (mobs don't always swing), so be conservative and
+        // assume it could happen whenever the player is blocking with an axe-wielder nearby.
+        if (MultiVersionCompat.INSTANCE.getProtocolVersion() >= MultiVersionCompat.V1_20_5 || !player.isBlocking()) {
+            return;
+        }
+        boolean axeNearby = !player.level().getEntitiesOfClass(
+            LivingEntity.class,
+            player.getBoundingBox().inflate(SHIELD_DISABLE_RANGE),
+            entity -> entity != player && entity.getMainHandItem().is(ItemTags.AXES)
+        ).isEmpty();
+        if (axeNearby) {
+            resetCracker(RNGCallType.SHIELD);
         }
     }
 
@@ -359,21 +435,22 @@ public class PlayerRandCracker {
         }
     }
 
-    public static ThrowItemsResult throwItemsUntil(Predicate<Random> condition, int max) {
+    public static ThrowItemsResult throwItemsUntil(Predicate<RandomSource> condition, int max) {
         if (!Configs.playerCrackState.knowsSeed()) {
             return new ThrowItemsResult(ThrowItemsResult.Type.UNKNOWN_SEED);
         }
         Configs.playerCrackState = CrackState.CRACKED;
 
         long seed = PlayerRandCracker.seed;
-        Random rand = new Random(seed ^ MULTIPLIER);
+        LegacyRandomSource rand = new LegacyRandomSource(0);
+        rand.seed.set(seed);
 
         int itemsNeeded = 0;
         for (; itemsNeeded <= max && !condition.test(rand); itemsNeeded++) {
             for (int i = 0; i < 4; i++) {
                 seed = (seed * MULTIPLIER + ADDEND) & MASK;
             }
-            rand.setSeed(seed ^ MULTIPLIER);
+            rand.seed.set(seed);
         }
         if (itemsNeeded > max) {
             return new ThrowItemsResult(ThrowItemsResult.Type.NOT_POSSIBLE, itemsNeeded);
@@ -604,6 +681,7 @@ public class PlayerRandCracker {
         ANVIL("anvil"),
         BANE_OF_ARTHROPODS("baneOfArthropods"),
         CONSUME("consume"),
+        CONSUME_STATUS_EFFECTS("consumeStatusEffects"),
         CROSSBOW("crossbow"),
         DESYNC("desync"),
         DRINK("drink"),
@@ -627,6 +705,7 @@ public class PlayerRandCracker {
         SOUL_SPEED("soulSpeed"),
         SPRINT("sprint"),
         SWIM("swim"),
+        TELEPORT("teleport"),
         UNBREAKING("unbreaking"),
         XP("xp"),
         ;
@@ -638,6 +717,17 @@ public class PlayerRandCracker {
 
         public Component getResetMessage() {
             return resetMessage;
+        }
+
+        public boolean isConsumableRelated() {
+            return switch (this) {
+                case FOOD,
+                    DRINK,
+                    CONSUME,
+                    CONSUME_STATUS_EFFECTS,
+                    TELEPORT -> true;
+                default -> false;
+            };
         }
     }
 
